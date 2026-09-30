@@ -304,3 +304,16 @@ fn stealth_transport_reports_http_status_and_recovers_after_failure() {
     assert_eq!(worker.navigate(&server.url("/ok"))["status"], 200);
     assert_eq!(worker.navigate("about:blank")["status"], Value::Null);
 }
+
+#[test]
+fn blocked_document_has_no_fabricated_http_status() {
+    // The blocklist short-circuits before DNS or HTTP, so this stays offline.
+    assert!(obscura_net::blocklist::is_blocked("google-analytics.com"));
+    let mut worker = Worker::with_stealth(true);
+    let result = worker.navigate("https://google-analytics.com/worker-status-test");
+    assert!(
+        result.as_object().unwrap().contains_key("status"),
+        "{result}"
+    );
+    assert_eq!(result["status"], Value::Null, "{result}");
+}

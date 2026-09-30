@@ -148,7 +148,8 @@ existing title and URL:
 script, image, or child frame's response. HTTP errors such as 404 and 503 still
 return `ok: true`: the server responded and the error document can be inspected
 with `dump_html`, `dump_text`, or `evaluate`. Navigation without an HTTP response,
-such as `about:blank` or a `data:` URL, returns `status: null`. A transport or
+such as `about:blank`, a `data:` URL, or a tracker blocked before the request,
+returns `status: null`. A transport or
 navigation failure retains the existing `{"ok":false,"error":"..."}` envelope
 without a `result` object.
 

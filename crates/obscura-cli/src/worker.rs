@@ -102,10 +102,12 @@ async fn main() {
                         // Navigation clears the event list and records the main
                         // Document response before scripts and child frames.
                         // Its status is the final response after HTTP redirects.
+                        // Zero denotes a blocked request, not an HTTP response.
                         let status = page.network_events.iter()
                             .find(|event| event.resource_type == "Document")
                             .filter(|event| {
-                                event.url.starts_with("http://") || event.url.starts_with("https://")
+                                event.status != 0
+                                    && (event.url.starts_with("http://") || event.url.starts_with("https://"))
                             })
                             .map(|event| event.status);
                         WorkerResponse::success(serde_json::json!({
