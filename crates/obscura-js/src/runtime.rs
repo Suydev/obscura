@@ -6975,6 +6975,179 @@ mod tests {
     }
 
     #[test]
+    fn concrete_svg_element_interfaces_are_defined_and_carry_their_tag() {
+        // #1043: a bare reference to a missing interface throws ReferenceError
+        // rather than evaluating to undefined, which is what took down
+        // html-to-image. `typeof` does not surface this, so probe with a bare
+        // reference the way page-side libraries do.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    SVGImageElement, SVGUseElement, SVGTextElement,
+                    SVGCircleElement, SVGRectElement, SVGAnimateElement,
+                    SVGMarkerElement, SVGTSpanElement, SVGLineElement,
+                    SVGGElement, SVGDefsElement, SVGStopElement,
+                    SVGFEImageElement, SVGFEFuncRElement, SVGFEGaussianBlurElement,
+                    SVGLinearGradientElement, SVGRadialGradientElement,
+                    SVGClipPathElement, SVGMaskElement, SVGPatternElement,
+                    SVGFilterElement, SVGForeignObjectElement, SVGSymbolElement,
+                    SVGAElement, SVGSwitchElement, SVGViewElement,
+                    SVGTitleElement, SVGDescElement, SVGMetadataElement,
+                    SVGStyleElement, SVGScriptElement, SVGSVGElement,
+                ].every((ctor) => typeof ctor === "function");
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(true));
+    }
+
+    #[test]
+    fn svg_elements_use_their_own_interface_not_the_generic_one() {
+        let mut rt = setup_runtime(
+            r#"<html><body><svg><image id="i"></image><use id="u"></use><text id="t">hi</text><circle id="c"></circle></svg></body></html>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    document.getElementById("i").constructor.name,
+                    document.getElementById("i") instanceof SVGImageElement,
+                    document.getElementById("u").constructor.name,
+                    document.getElementById("u") instanceof SVGUseElement,
+                    document.getElementById("t").constructor.name,
+                    document.getElementById("t") instanceof SVGTextElement,
+                    document.getElementById("c").constructor.name,
+                    document.getElementById("c") instanceof SVGCircleElement,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "SVGImageElement",
+                true,
+                "SVGUseElement",
+                true,
+                "SVGTextElement",
+                true,
+                "SVGCircleElement",
+                true
+            ])
+        );
+    }
+
+    #[test]
+    fn created_svg_elements_use_their_own_interface() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const ns = "http://www.w3.org/2000/svg";
+                const made = document.createElementNS(ns, "image");
+                const rect = document.createElementNS(ns, "rect");
+                const defs = document.createElementNS(ns, "defs");
+                return [
+                    made instanceof SVGImageElement,
+                    made instanceof SVGGraphicsElement,
+                    rect instanceof SVGRectElement,
+                    rect instanceof SVGGeometryElement,
+                    defs instanceof SVGDefsElement,
+                    defs instanceof SVGContainerElement,
+                    defs instanceof SVGGraphicsElement,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn svg_geometry_interfaces_share_the_standard_ancestor_chain() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                return [
+                    Object.getPrototypeOf(SVGImageElement.prototype) === SVGGraphicsElement.prototype,
+                    Object.getPrototypeOf(SVGUseElement.prototype) === SVGGraphicsElement.prototype,
+                    Object.getPrototypeOf(SVGCircleElement.prototype) === SVGGeometryElement.prototype,
+                    Object.getPrototypeOf(SVGTextElement.prototype) === SVGTextContentElement.prototype,
+                    Object.getPrototypeOf(SVGDefsElement.prototype) === SVGContainerElement.prototype,
+                    Object.getPrototypeOf(SVGRectElement.prototype) === SVGGeometryElement.prototype,
+                    Object.getPrototypeOf(SVGFEImageElement.prototype)
+                        === SVGFilterPrimitiveStandardElement.prototype,
+                    Object.getPrototypeOf(SVGFEFuncRElement.prototype)
+                        === SVGComponentTransferFunctionElement.prototype,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, true, true, true, true, true, true, true])
+        );
+    }
+
+    #[test]
+    fn svg_interface_lookup_ignores_html_and_dangerous_keys() {
+        // The lookup table is keyed by a page-supplied local name, so a
+        // `<constructor>` or `__proto__` element must not resolve to an
+        // inherited Object property and be handed back as a constructor.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const ns = "http://www.w3.org/2000/svg";
+                const probe = (name) => {
+                    const el = document.createElementNS(ns, name);
+                    return el.constructor.name;
+                };
+                return [
+                    probe("constructor"),
+                    probe("__proto__"),
+                    probe("toString"),
+                    probe("hasOwnProperty"),
+                    document.createElement("constructor").constructor.name,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["SVGElement", "SVGElement", "SVGElement", "SVGElement", "Element"])
+        );
+    }
+
+    #[test]
+    fn html_lookalike_tags_keep_their_html_interfaces() {
+        // A `<text>` or `<image>` in the HTML namespace is not an SVG element,
+        // so the new SVG table must not claim it.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const text = document.createElement("text");
+                const image = document.createElement("image");
+                const div = document.createElement("div");
+                return [
+                    text instanceof SVGTextElement,
+                    text instanceof Element,
+                    image instanceof SVGImageElement,
+                    div instanceof SVGElement,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([false, true, false, false]));
+    }
+
+    #[test]
     fn foreign_inner_html_and_contextual_fragments_keep_svg_namespace() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let v = rt
