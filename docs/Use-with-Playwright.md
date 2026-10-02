@@ -38,6 +38,15 @@ const items = await page.$$eval('.item', els => els.map(el => ({
 })));
 ```
 
+## SVG element interfaces
+
+SVG nodes created with `document.createElementNS` or parsed from SVG markup
+expose their corresponding interfaces, such as `SVGImageElement` and
+`SVGUseElement`, with prototype ancestry from the [SVG IDL](https://svgwg.org/svg2-draft/idl.html)
+and [Filter Effects IDL](https://www.w3.org/TR/filter-effects-1/#svg-interfaces). This supports interface
+checks in page scripts; it does not imply support for every SVG property,
+method or rendering feature.
+
 ## Interact
 
 ```js

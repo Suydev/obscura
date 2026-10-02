@@ -69,7 +69,30 @@ const __obscuraCore = globalThis.Deno.core;
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
-    'SVGSVGElement',
+    'SVGSVGElement', 'SVGGElement', 'SVGDefsElement', 'SVGSymbolElement',
+    'SVGUseElement', 'SVGMarkerElement', 'SVGAElement', 'SVGSwitchElement',
+    'SVGImageElement', 'SVGForeignObjectElement', 'SVGRectElement',
+    'SVGCircleElement', 'SVGEllipseElement', 'SVGLineElement',
+    'SVGPolylineElement', 'SVGPolygonElement', 'SVGTextElement',
+    'SVGTSpanElement', 'SVGTextPathElement',
+    'SVGTextContentElement', 'SVGTextPositioningElement', 'SVGGradientElement',
+    'SVGLinearGradientElement', 'SVGRadialGradientElement', 'SVGStopElement',
+    'SVGClipPathElement', 'SVGMaskElement', 'SVGPatternElement',
+    'SVGFilterElement', 'SVGScriptElement', 'SVGStyleElement', 'SVGViewElement',
+    'SVGTitleElement', 'SVGDescElement', 'SVGMetadataElement',
+    'SVGAnimationElement', 'SVGAnimateElement',
+    'SVGAnimateMotionElement', 'SVGAnimateTransformElement', 'SVGSetElement',
+    'SVGComponentTransferFunctionElement',
+    'SVGFEFuncRElement', 'SVGFEFuncGElement', 'SVGFEFuncBElement',
+    'SVGFEFuncAElement', 'SVGFEBlendElement', 'SVGFEColorMatrixElement',
+    'SVGFEComponentTransferElement', 'SVGFECompositeElement',
+    'SVGFEConvolveMatrixElement', 'SVGFEDiffuseLightingElement',
+    'SVGFEDisplacementMapElement', 'SVGFEDistantLightElement',
+    'SVGFEDropShadowElement', 'SVGFEFloodElement', 'SVGFEGaussianBlurElement',
+    'SVGFEImageElement', 'SVGFEMergeElement', 'SVGFEMergeNodeElement',
+    'SVGFEMorphologyElement', 'SVGFEOffsetElement', 'SVGFEPointLightElement',
+    'SVGFESpecularLightingElement', 'SVGFESpotLightElement', 'SVGFETileElement',
+    'SVGFETurbulenceElement',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -6930,8 +6953,8 @@ function _elementClassFor(nid) {
   // namespace for possible SVG wrappers.
   if (tag && tag !== tag.toUpperCase()
       && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    const svgClass = _svgElementClasses[tag];
+    if (svgClass) return svgClass;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
@@ -6960,8 +6983,8 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
   if (namespace === "http://www.w3.org/2000/svg") {
-    if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    const svgClass = _svgElementClasses[localName];
+    if (svgClass) return svgClass;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
@@ -12548,13 +12571,186 @@ class SVGElement extends Element {
 }
 class SVGGraphicsElement extends SVGElement {}
 class SVGGeometryElement extends SVGGraphicsElement {}
+class SVGTextContentElement extends SVGGraphicsElement {}
+class SVGTextPositioningElement extends SVGTextContentElement {}
+class SVGGradientElement extends SVGElement {}
+class SVGAnimationElement extends SVGElement {}
+class SVGComponentTransferFunctionElement extends SVGElement {}
 class SVGPathElement extends SVGGeometryElement {}
+class SVGRectElement extends SVGGeometryElement {}
+class SVGCircleElement extends SVGGeometryElement {}
+class SVGEllipseElement extends SVGGeometryElement {}
+class SVGLineElement extends SVGGeometryElement {}
+class SVGPolylineElement extends SVGGeometryElement {}
+class SVGPolygonElement extends SVGGeometryElement {}
+class SVGTextElement extends SVGTextPositioningElement {}
+class SVGTSpanElement extends SVGTextPositioningElement {}
+class SVGTextPathElement extends SVGTextContentElement {}
 class SVGSVGElement extends SVGGraphicsElement {}
+class SVGGElement extends SVGGraphicsElement {}
+class SVGDefsElement extends SVGGraphicsElement {}
+class SVGSymbolElement extends SVGGraphicsElement {}
+class SVGUseElement extends SVGGraphicsElement {}
+class SVGMarkerElement extends SVGElement {}
+class SVGAElement extends SVGGraphicsElement {}
+class SVGSwitchElement extends SVGGraphicsElement {}
+class SVGImageElement extends SVGGraphicsElement {}
+class SVGForeignObjectElement extends SVGGraphicsElement {}
+class SVGLinearGradientElement extends SVGGradientElement {}
+class SVGRadialGradientElement extends SVGGradientElement {}
+class SVGClipPathElement extends SVGElement {}
+class SVGMaskElement extends SVGElement {}
+class SVGPatternElement extends SVGElement {}
+class SVGFilterElement extends SVGElement {}
+class SVGScriptElement extends SVGElement {}
+class SVGStyleElement extends SVGElement {}
+class SVGViewElement extends SVGElement {}
+class SVGTitleElement extends SVGElement {}
+class SVGDescElement extends SVGElement {}
+class SVGMetadataElement extends SVGElement {}
+class SVGStopElement extends SVGElement {}
+class SVGAnimateElement extends SVGAnimationElement {}
+class SVGAnimateMotionElement extends SVGAnimationElement {}
+class SVGAnimateTransformElement extends SVGAnimationElement {}
+class SVGSetElement extends SVGAnimationElement {}
+class SVGFEFuncRElement extends SVGComponentTransferFunctionElement {}
+class SVGFEFuncGElement extends SVGComponentTransferFunctionElement {}
+class SVGFEFuncBElement extends SVGComponentTransferFunctionElement {}
+class SVGFEFuncAElement extends SVGComponentTransferFunctionElement {}
+// Filter and light-source interfaces inherit SVGElement. Transfer functions
+// use SVGComponentTransferFunctionElement and are declared above.
+const _feClasses = Object.create(null);
+for (const _feName of [
+  "Blend", "ColorMatrix", "ComponentTransfer", "Composite", "ConvolveMatrix",
+  "DiffuseLighting", "DisplacementMap", "DistantLight", "DropShadow", "Flood",
+  "GaussianBlur", "Image", "Merge", "MergeNode", "Morphology", "Offset",
+  "PointLight", "SpecularLighting", "SpotLight", "Tile", "Turbulence",
+]) {
+  class _FE extends SVGElement {}
+  Object.defineProperty(_FE, "name", { value: "SVGFE" + _feName + "Element" });
+  _feClasses[_feName] = _FE;
+  globalThis["SVGFE" + _feName + "Element"] = _FE;
+}
 globalThis.SVGElement = SVGElement;
 globalThis.SVGGraphicsElement = SVGGraphicsElement;
 globalThis.SVGGeometryElement = SVGGeometryElement;
+globalThis.SVGTextContentElement = SVGTextContentElement;
+globalThis.SVGTextPositioningElement = SVGTextPositioningElement;
+globalThis.SVGGradientElement = SVGGradientElement;
+globalThis.SVGAnimationElement = SVGAnimationElement;
+globalThis.SVGComponentTransferFunctionElement = SVGComponentTransferFunctionElement;
 globalThis.SVGPathElement = SVGPathElement;
+globalThis.SVGRectElement = SVGRectElement;
+globalThis.SVGCircleElement = SVGCircleElement;
+globalThis.SVGEllipseElement = SVGEllipseElement;
+globalThis.SVGLineElement = SVGLineElement;
+globalThis.SVGPolylineElement = SVGPolylineElement;
+globalThis.SVGPolygonElement = SVGPolygonElement;
+globalThis.SVGTextElement = SVGTextElement;
+globalThis.SVGTSpanElement = SVGTSpanElement;
+globalThis.SVGTextPathElement = SVGTextPathElement;
 globalThis.SVGSVGElement = SVGSVGElement;
+globalThis.SVGGElement = SVGGElement;
+globalThis.SVGDefsElement = SVGDefsElement;
+globalThis.SVGSymbolElement = SVGSymbolElement;
+globalThis.SVGUseElement = SVGUseElement;
+globalThis.SVGMarkerElement = SVGMarkerElement;
+globalThis.SVGAElement = SVGAElement;
+globalThis.SVGSwitchElement = SVGSwitchElement;
+globalThis.SVGImageElement = SVGImageElement;
+globalThis.SVGForeignObjectElement = SVGForeignObjectElement;
+globalThis.SVGLinearGradientElement = SVGLinearGradientElement;
+globalThis.SVGRadialGradientElement = SVGRadialGradientElement;
+globalThis.SVGClipPathElement = SVGClipPathElement;
+globalThis.SVGMaskElement = SVGMaskElement;
+globalThis.SVGPatternElement = SVGPatternElement;
+globalThis.SVGFilterElement = SVGFilterElement;
+globalThis.SVGScriptElement = SVGScriptElement;
+globalThis.SVGStyleElement = SVGStyleElement;
+globalThis.SVGViewElement = SVGViewElement;
+globalThis.SVGTitleElement = SVGTitleElement;
+globalThis.SVGDescElement = SVGDescElement;
+globalThis.SVGMetadataElement = SVGMetadataElement;
+globalThis.SVGStopElement = SVGStopElement;
+globalThis.SVGAnimateElement = SVGAnimateElement;
+globalThis.SVGAnimateMotionElement = SVGAnimateMotionElement;
+globalThis.SVGAnimateTransformElement = SVGAnimateTransformElement;
+globalThis.SVGSetElement = SVGSetElement;
+globalThis.SVGFEFuncRElement = SVGFEFuncRElement;
+globalThis.SVGFEFuncGElement = SVGFEFuncGElement;
+globalThis.SVGFEFuncBElement = SVGFEFuncBElement;
+globalThis.SVGFEFuncAElement = SVGFEFuncAElement;
+// Element interfaces keyed by the case-sensitive SVG local name the tree
+// reports: the HTML parser uppercases HTML tagName but preserves foreign
+// casing, so `linearGradient` and `clipPath` match as written. `_elementClassFor`
+// and `_elementClassForKnownName` both read this, so a parsed or created element
+// gets its standard interface and `instanceof` agrees with the constructor.
+// The prototype is null because these keys come from page markup, and a bare
+// `<constructor>` element must not resolve to `Object.prototype.constructor`.
+const _svgElementClasses = Object.assign(Object.create(null), {
+  a: SVGAElement,
+  animate: SVGAnimateElement,
+  animateMotion: SVGAnimateMotionElement,
+  animateTransform: SVGAnimateTransformElement,
+  circle: SVGCircleElement,
+  clipPath: SVGClipPathElement,
+  defs: SVGDefsElement,
+  desc: SVGDescElement,
+  ellipse: SVGEllipseElement,
+  feBlend: _feClasses.Blend,
+  feColorMatrix: _feClasses.ColorMatrix,
+  feComponentTransfer: _feClasses.ComponentTransfer,
+  feComposite: _feClasses.Composite,
+  feConvolveMatrix: _feClasses.ConvolveMatrix,
+  feDiffuseLighting: _feClasses.DiffuseLighting,
+  feDisplacementMap: _feClasses.DisplacementMap,
+  feDistantLight: _feClasses.DistantLight,
+  feDropShadow: _feClasses.DropShadow,
+  feFlood: _feClasses.Flood,
+  feFuncA: SVGFEFuncAElement,
+  feFuncB: SVGFEFuncBElement,
+  feFuncG: SVGFEFuncGElement,
+  feFuncR: SVGFEFuncRElement,
+  feGaussianBlur: _feClasses.GaussianBlur,
+  feImage: _feClasses.Image,
+  feMerge: _feClasses.Merge,
+  feMergeNode: _feClasses.MergeNode,
+  feMorphology: _feClasses.Morphology,
+  feOffset: _feClasses.Offset,
+  fePointLight: _feClasses.PointLight,
+  feSpecularLighting: _feClasses.SpecularLighting,
+  feSpotLight: _feClasses.SpotLight,
+  feTile: _feClasses.Tile,
+  feTurbulence: _feClasses.Turbulence,
+  filter: SVGFilterElement,
+  foreignObject: SVGForeignObjectElement,
+  g: SVGGElement,
+  image: SVGImageElement,
+  line: SVGLineElement,
+  linearGradient: SVGLinearGradientElement,
+  marker: SVGMarkerElement,
+  mask: SVGMaskElement,
+  metadata: SVGMetadataElement,
+  path: SVGPathElement,
+  pattern: SVGPatternElement,
+  polygon: SVGPolygonElement,
+  polyline: SVGPolylineElement,
+  radialGradient: SVGRadialGradientElement,
+  rect: SVGRectElement,
+  script: SVGScriptElement,
+  set: SVGSetElement,
+  stop: SVGStopElement,
+  style: SVGStyleElement,
+  svg: SVGSVGElement,
+  switch: SVGSwitchElement,
+  symbol: SVGSymbolElement,
+  text: SVGTextElement,
+  textPath: SVGTextPathElement,
+  title: SVGTitleElement,
+  tspan: SVGTSpanElement,
+  use: SVGUseElement,
+  view: SVGViewElement,
+});
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
