@@ -98,6 +98,7 @@ impl FrameRealm {
         }
 
         let mut state = ObscuraState::new();
+        state.navigation_timing.record("domLoading");
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
         state.frame_id = frame_id;
@@ -147,20 +148,40 @@ impl FrameRealm {
     /// can talk to its parent perfectly and still never build its interface,
     /// which looks like a rendering problem and is a lifecycle one.
     pub fn dispatch_load_events(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
+        let state = self.realms.borrow().by_frame_id(self.frame_id)
+            .ok_or_else(|| "Frame no longer exists".to_string())?;
+        {
+            let mut state = state.borrow_mut();
+            state.navigation_timing.record("domInteractive");
+            state.navigation_timing.record("domContentLoadedEventStart");
+        }
         self.execute_script(
             parent,
             "globalThis.__documentReadyState__ = 'interactive';\
              try { document.dispatchEvent(new Event('DOMContentLoaded', \
                  { bubbles: false, cancelable: false })); } catch (_) {}\
              try { window.dispatchEvent(new Event('DOMContentLoaded', \
-                 { bubbles: false, cancelable: false })); } catch (_) {}\
-             globalThis.__documentReadyState__ = 'complete';\
+                 { bubbles: false, cancelable: false })); } catch (_) {}",
+        )?;
+        {
+            let mut state = state.borrow_mut();
+            state.navigation_timing.record("domContentLoadedEventEnd");
+            state.navigation_timing.record("domComplete");
+            state.navigation_timing.record("loadEventStart");
+        }
+        let result = self.execute_script(
+            parent,
+            "globalThis.__documentReadyState__ = 'complete';\
              try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
              try { const loadEvent = new Event('load', \
                  { bubbles: false, cancelable: false }); \
                  if (typeof window.onload === 'function') { try { window.onload.call(window, loadEvent); } catch (_) {} } \
                  try { window.dispatchEvent(loadEvent); } catch (_) {} } catch (_) {}",
-        )
+        );
+        if result.is_ok() {
+            state.borrow_mut().navigation_timing.record("loadEventEnd");
+        }
+        result
     }
 
     /// Delivers a `postMessage` that another realm sent to this one.
@@ -827,6 +848,47 @@ mod tests {
             serde_json::json!(["object", "object", 0]),
             "the retained frame realm did not discard its scheduler listener",
         );
+    }
+
+    #[test]
+    fn frame_navigation_timing_records_its_own_event_boundaries() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body></body></html>").unwrap();
+        frame.execute_script(&mut parent, r#"
+            globalThis.samples = [];
+            function sample() {
+                samples.push([performance.timing.domContentLoadedEventStart,
+                    performance.timing.domContentLoadedEventEnd,
+                    performance.timing.loadEventStart, performance.timing.loadEventEnd]);
+            }
+            document.addEventListener('DOMContentLoaded', sample);
+            window.addEventListener('load', sample);
+            Date.now = () => 0;
+        "#).unwrap();
+        frame.dispatch_load_events(&mut parent).unwrap();
+        assert_eq!(frame.evaluate(&mut parent, r#"(() => {
+            const [dom, load] = samples;
+            return [dom[0] > 0 && dom[1] === 0, load[2] > 0 && load[3] === 0,
+                performance.timing.domContentLoadedEventEnd >= dom[0],
+                performance.timing.loadEventEnd >= load[2]];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true]));
+        assert_eq!(parent.evaluate("performance.timing.loadEventEnd").unwrap().as_f64(), Some(0.0));
+    }
+
+    #[test]
+    fn frame_navigation_timing_terminated_load_does_not_record_completion() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+            "<html><body></body></html>").unwrap();
+        frame.execute_script(&mut parent,
+            "window.addEventListener('load',()=>{globalThis.entered=true;while(true){}});").unwrap();
+        let token = parent.arm_watchdog(std::time::Duration::from_millis(250));
+        let result = frame.dispatch_load_events(&mut parent);
+        let fired = parent.disarm_watchdog(token);
+        assert!(fired && result.is_err(), "the infinite load handler must be terminated");
+        assert_eq!(frame.evaluate(&mut parent, "globalThis.entered === true").unwrap(), serde_json::json!(true));
+        assert_eq!(frame.evaluate(&mut parent, "performance.timing.loadEventEnd").unwrap().as_f64(), Some(0.0));
     }
 
     #[test]

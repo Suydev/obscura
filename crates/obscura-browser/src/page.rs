@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
-use obscura_js::ops::max_live_frames;
+use obscura_js::ops::{max_live_frames, NavigationTiming};
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -281,6 +281,7 @@ pub struct Page {
     /// It is reset once author styles are installed, so stylesheet download
     /// latency does not incorrectly advance newly-created animations.
     document_timeline_origin: std::time::Instant,
+    navigation_timing: NavigationTiming,
     /// Optional page-scoped ceiling for an end-to-end navigation. Automation
     /// frontends set this from their request timeout so a caller asking for a
     /// 50-second navigation is not silently cut off by the process default.
@@ -1110,6 +1111,7 @@ impl Page {
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
+            navigation_timing: NavigationTiming::default(),
             navigation_timeout: None,
             navigation_chain_limit: None,
             history: Vec::new(),
@@ -1841,6 +1843,7 @@ impl Page {
             rt.set_dom(dom);
         }
 
+        rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
         let _ = rt.execute_script(
             "<device-metrics>",
@@ -2838,6 +2841,7 @@ impl Page {
         // They still gate DOMContentLoaded, but observe the browser's
         // `interactive` readyState while they execute.
         if let Some(js) = &mut self.js {
+            js.record_navigation_timing("domInteractive");
             let _ = js.execute_script(
                 "<ready-state-interactive>",
                 "globalThis.__documentReadyState__ = 'interactive';",
@@ -2923,11 +2927,15 @@ impl Page {
             // dynamic script elements do not gate it. They do remain in the
             // document's load-event delay set, including scripts inserted by
             // a DOMContentLoaded listener.
-            let _ = js.execute_script(
+            js.record_navigation_timing("domContentLoadedEventStart");
+            let completed = js.execute_script(
                 "<dom-content-loaded>",
                 "try { document.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}\n\
                  try { window.dispatchEvent(new Event('DOMContentLoaded', {bubbles:false,cancelable:false})); } catch(e) {}",
             );
+            if completed.is_ok() {
+                js.record_navigation_timing("domContentLoadedEventEnd");
+            }
 
             let load_blockers_finished =
                 Self::drive_load_delaying_scripts(js, script_deadline).await;
@@ -2940,7 +2948,9 @@ impl Page {
             // readyState becomes complete before the load event. A script
             // inserted by an onload handler is therefore post-load work and
             // remains pending until an explicit caller settle/wait.
-            let _ = js.execute_script(
+            js.record_navigation_timing("domComplete");
+            js.record_navigation_timing("loadEventStart");
+            let completed = js.execute_script(
                 "<load-event>",
                 "globalThis.__documentReadyState__ = 'complete';\n\
                  try {\n\
@@ -2948,6 +2958,9 @@ impl Page {
                    try { window.dispatchEvent(loadEvent); } catch(e) {}\n\
                  } catch(e) {}",
             );
+            if completed.is_ok() {
+                js.record_navigation_timing("loadEventEnd");
+            }
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -3354,6 +3367,7 @@ impl Page {
         referrer: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        self.navigation_timing = NavigationTiming::default();
 
         // The previous document's background loads end with the document.
         self.retire_render_resources();
@@ -3415,6 +3429,7 @@ impl Page {
             return Ok(());
         }
 
+        self.navigation_timing.record("fetchStart");
         let response = if url.scheme() == "data" {
             let content_type = url_str
                 .strip_prefix("data:")
@@ -3445,6 +3460,7 @@ impl Page {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
         })?;
+        self.navigation_timing.record("responseEnd");
 
         // Store binary main resources (images, PDFs, octet-stream) base64 so
         // Network.getResponseBody returns intact bytes. A UTF-8-lossy text store
@@ -3471,6 +3487,7 @@ impl Page {
         let (body_text, encoding_name) =
             obscura_net::decode_response_with_name(&response.body, response.content_type());
         self.encoding = encoding_name.to_string();
+        self.navigation_timing.record("domLoading");
         let dom = parse_html(&body_text);
 
         self.title = dom
@@ -3721,6 +3738,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.navigation_timing = NavigationTiming::default();
         self.retire_render_resources();
         self.pending_frame_work.clear();
         self.frames.clear();
@@ -4664,6 +4682,7 @@ impl Page {
             return;
         };
         let started_script_ids = js.started_script_ids();
+        self.navigation_timing = js.navigation_timing();
         // Preserve console messages logged before suspension: dropping the
         // runtime below would otherwise lose any not yet drained (#971).
         let pending_console = js.take_pending_console_messages();
@@ -7555,6 +7574,82 @@ mod tests {
                 .unwrap(),
             serde_json::json!(true),
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_records_lifecycle_boundaries_not_future_events() {
+        let mut page = import_map_test_page(
+            "navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        let html = r#"<!doctype html><script>
+            globalThis.__navigationSamples = [];
+            function sample() {
+                const timing = performance.timing;
+                __navigationSamples.push([
+                    timing.navigationStart, timing.responseEnd,
+                    timing.domContentLoadedEventStart, timing.domContentLoadedEventEnd,
+                    timing.loadEventStart, timing.loadEventEnd
+                ]);
+            }
+            sample();
+            document.addEventListener('DOMContentLoaded', sample);
+            window.addEventListener('load', sample);
+        </script><p>Real navigation timing</p>"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+        page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+        let actual = page.js.as_mut().unwrap().evaluate(r#"(() => {
+            const [parser, dom, load] = __navigationSamples;
+            const final = performance.timing;
+            return [
+                parser[3] === 0 && parser[5] === 0,
+                Number.isFinite(parser[1]) && parser[1] >= parser[0],
+                dom[2] > 0 && dom[3] === 0,
+                load[4] > 0 && load[5] === 0,
+                final.domContentLoadedEventEnd >= dom[2],
+                final.loadEventStart >= final.domContentLoadedEventEnd,
+                final.loadEventEnd >= load[4],
+                performance.timeOrigin >= final.navigationStart
+                    && performance.timeOrigin < final.navigationStart + 1
+            ];
+        })()"#).unwrap();
+        assert_eq!(actual, serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_survives_suspension_but_resets_on_navigation() {
+        let mut page = import_map_test_page(
+            "navigation-timing-retention", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        page.navigate("data:text/html,<p>First</p>").await.unwrap();
+        let expression = "[performance.timeOrigin, performance.timing.navigationStart, performance.timing.loadEventEnd]";
+        let before = page.js.as_mut().unwrap().evaluate(expression).unwrap();
+        assert!(before[2].as_f64().unwrap() > before[1].as_f64().unwrap());
+        page.suspend_js();
+        page.resume_js();
+        assert_eq!(page.js.as_mut().unwrap().evaluate(expression).unwrap(), before);
+        page.navigate("data:text/html,<p>Second</p>").await.unwrap();
+        let after = page.js.as_mut().unwrap().evaluate(expression).unwrap();
+        assert!(after[0].as_f64().unwrap() > before[0].as_f64().unwrap());
+        assert!(after[1].as_f64().unwrap() >= before[2].as_f64().unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_timing_terminated_handlers_do_not_record_completion() {
+        std::env::set_var("OBSCURA_SCRIPT_DEADLINE_MS", "250");
+        let mut page = import_map_test_page(
+            "terminated-navigation-timing", "http://127.0.0.1:9", "<html><body></body></html>",
+        );
+        for (event, field) in [
+            ("DOMContentLoaded", "domContentLoadedEventEnd"), ("load", "loadEventEnd"),
+        ] {
+            let html = format!("<script>window.addEventListener('{event}',()=>{{globalThis.entered=true;while(true){{}}}});</script>");
+            let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+            page.navigate(&format!("data:text/html;base64,{encoded}")).await.unwrap();
+            assert_eq!(page.js.as_mut().unwrap().evaluate("globalThis.entered === true").unwrap(),
+                serde_json::json!(true), "the {event} handler must actually have started");
+            assert_eq!(page.js.as_mut().unwrap().evaluate(&format!("performance.timing.{field}")).unwrap().as_f64(),
+                Some(0.0), "the terminated {event} handler never completed");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -6323,16 +6323,22 @@ class Document extends Node {
       // document.write's parser-blocking queue may still be fetching a
       // classic script. It must finish before DOMContentLoaded is observable.
       if (__parserBlockingScriptPending > 0) { setTimeout(finishParsing, 1); return; }
+      _dom('performance_lifecycle', 'domInteractive');
       globalThis.__documentReadyState__ = 'interactive';
       this.dispatchEvent(new Event('readystatechange'));
+      _dom('performance_lifecycle', 'domContentLoadedEventStart');
       this.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+      _dom('performance_lifecycle', 'domContentLoadedEventEnd');
       _dom('document_lifecycle', 'DOMContentLoaded');
       const complete = () => {
         if (generation !== this._writeGeneration) return;
         if (__dynLoadDelayingPending > 0) { setTimeout(complete, 1); return; }
+        _dom('performance_lifecycle', 'domComplete');
         globalThis.__documentReadyState__ = 'complete';
         this.dispatchEvent(new Event('readystatechange'));
+        _dom('performance_lifecycle', 'loadEventStart');
         globalThis.dispatchEvent(new Event('load'));
+        _dom('performance_lifecycle', 'loadEventEnd');
         _dom('document_lifecycle', 'load');
       };
       complete();
@@ -10434,12 +10440,6 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
-globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
-// Feature detection reads this static before deciding to observe anything;
-// absent it, supportedEntryTypes.includes(...) throws and instrumentation
-// bails. Report only types the engine can actually emit records for.
-PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
-_markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -11352,9 +11352,7 @@ globalThis.performance = globalThis.performance || {
       return _last;
     };
   })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
+  clearResourceTimings(){},
   setResourceTimingBufferSize(){},
   timeOrigin: 0,
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
@@ -11365,6 +11363,289 @@ globalThis.performance = globalThis.performance || {
     usedJSHeapSize: 16781520,
   },
 };
+
+// User Timing entries belong to this realm. The registry gives marks/measures
+// an unlimited timeline: retain them until clearMarks/clearMeasures or teardown,
+// not an arbitrary cap that silently invalidates long-running measurements.
+(function() {
+  const perf = globalThis.performance;
+  globalThis.Performance = class Performance {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  };
+  Object.setPrototypeOf(perf, Performance.prototype);
+  const buffers = Object.assign(Object.create(null), {mark: [], measure: []});
+  const latestMarks = new Map();
+  const entryState = new WeakMap();
+  const observerState = new WeakMap();
+  const listState = new WeakMap();
+  const observers = new Set();
+  const entryKey = {};
+  const supported = Object.freeze(['mark', 'measure']);
+  const timingNames = new Set([
+    'navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading',
+    'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd',
+    'domComplete', 'loadEventStart', 'loadEventEnd',
+  ]);
+  let deliveryPending = false;
+  function state(map, receiver) {
+    const value = map.get(receiver);
+    if (!value) throw new TypeError('Illegal invocation');
+    return value;
+  }
+  function string(value) {
+    if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to a string');
+    return String(value);
+  }
+  function dictionary(value) {
+    if (value == null) return {};
+    if (typeof value !== 'object' && typeof value !== 'function') throw new TypeError('Expected a dictionary');
+    return value;
+  }
+  function number(value) {
+    const result = +value;
+    if (!Number.isFinite(result)) throw new TypeError('Timestamp must be finite');
+    return result;
+  }
+  function timestamp(value) {
+    if (typeof value === 'number') {
+      value = number(value);
+      if (value < 0) throw new TypeError('Timestamp must not be negative');
+      return value;
+    }
+    value = string(value);
+    if (timingNames.has(value)) {
+      if (value === 'navigationStart') return 0;
+      const time = perf.timing[value] || 0;
+      if (!time) throw new DOMException('Timing event has not occurred', 'InvalidAccessError');
+      return time - perf.timing.navigationStart;
+    }
+    const mark = latestMarks.get(value);
+    if (!mark) throw new DOMException('The mark does not exist: ' + value, 'SyntaxError');
+    return entryState.get(mark).startTime;
+  }
+  function entries(buffer, name, type) {
+    return buffer.filter(entry => {
+      const data = entryState.get(entry);
+      return (name === undefined || data.name === name) && (type === undefined || data.entryType === type);
+    }).sort((a, b) => entryState.get(a).startTime - entryState.get(b).startTime);
+  }
+  function allEntries() { return buffers.mark.concat(buffers.measure); }
+  function checkPerformance(receiver) {
+    if (receiver !== perf) throw new TypeError('Illegal invocation');
+  }
+  globalThis.PerformanceEntry = class PerformanceEntry {
+    constructor(key) { if (key !== entryKey) throw new TypeError('Illegal constructor'); }
+    get name() { return state(entryState, this).name; }
+    get entryType() { return state(entryState, this).entryType; }
+    get startTime() { return state(entryState, this).startTime; }
+    get duration() { return state(entryState, this).duration; }
+    toJSON() {
+      const data = state(entryState, this);
+      return {name: data.name, entryType: data.entryType, startTime: data.startTime, duration: data.duration, detail: data.detail};
+    }
+  };
+  globalThis.PerformanceMark = class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      super(entryKey);
+      if (!arguments.length) throw new TypeError('A mark name is required');
+      name = string(name);
+      options = dictionary(options);
+      const detail = options.detail;
+      const start = options.startTime;
+      const startTime = start === undefined ? perf.now() : number(start);
+      if (timingNames.has(name)) throw new DOMException('Reserved timing name: ' + name, 'SyntaxError');
+      if (startTime < 0) throw new TypeError('Timestamp must not be negative');
+      entryState.set(this, {name, entryType: 'mark', startTime, duration: 0,
+        detail: detail === undefined ? null : _structuredClone(detail, new Map())});
+    }
+    get detail() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'mark') throw new TypeError('Illegal invocation');
+      return data.detail;
+    }
+  };
+  globalThis.PerformanceMeasure = class PerformanceMeasure extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get detail() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'measure') throw new TypeError('Illegal invocation');
+      return data.detail;
+    }
+  };
+  function queueDelivery() {
+    if (deliveryPending) return;
+    deliveryPending = true;
+    // Reuse browser posted tasks: asynchronous delivery without a timer-wheel
+    // delay or polling, cancelled at the document-generation boundary.
+    _browserPostedTaskEnqueue(() => {
+      deliveryPending = false;
+      for (const observer of Array.from(observers)) {
+        const data = observerState.get(observer);
+        if (!data.records.length) continue;
+        const list = Object.create(PerformanceObserverEntryList.prototype);
+        listState.set(list, data.records);
+        data.records = [];
+        const options = data.requiresDroppedEntries ? {droppedEntriesCount: 0} : {};
+        data.requiresDroppedEntries = false;
+        try { data.callback.call(observer, list, observer, options); }
+        catch (error) { globalThis.reportError(error); }
+      }
+    }, 0, _browserPostedTaskGeneration(), () => {
+      deliveryPending = false;
+      for (const observer of observers) observerState.get(observer).records = [];
+    });
+  }
+  function record(entry) {
+    const data = entryState.get(entry);
+    buffers[data.entryType].push(entry);
+    if (data.entryType === 'mark') {
+      const previous = latestMarks.get(data.name);
+      if (!previous || entryState.get(previous).startTime <= data.startTime) latestMarks.set(data.name, entry);
+    }
+    let notify = false;
+    for (const observer of observers) {
+      const observerData = observerState.get(observer);
+      if (observerData.types.has(data.entryType)) { observerData.records.push(entry); notify = true; }
+    }
+    if (notify) queueDelivery();
+    return entry;
+  }
+  perf.mark = function mark(name, options = {}) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A mark name is required');
+    return record(new PerformanceMark(name, options));
+  };
+  perf.measure = function measure(name, startOrOptions = {}, endMark) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A measure name is required');
+    name = string(name);
+    const isOptions = startOrOptions == null || typeof startOrOptions === 'object' || typeof startOrOptions === 'function';
+    let start, end, duration, detail;
+    if (isOptions) {
+      const options = dictionary(startOrOptions);
+      detail = options.detail;
+      const rawDuration = options.duration;
+      duration = rawDuration === undefined ? undefined : number(rawDuration);
+      end = options.end;
+      if (typeof end === 'number') end = number(end);
+      else if (end !== undefined) end = string(end);
+      start = options.start;
+      if (typeof start === 'number') start = number(start);
+      else if (start !== undefined) start = string(start);
+      if (start !== undefined || end !== undefined || duration !== undefined || detail !== undefined) {
+        if (endMark !== undefined || (start === undefined && end === undefined) ||
+            (start !== undefined && end !== undefined && duration !== undefined)) throw new TypeError('Invalid measure options');
+      }
+    } else start = string(startOrOptions);
+    if (endMark !== undefined) end = string(endMark);
+    const endTime = end !== undefined ? timestamp(end) :
+      start !== undefined && duration !== undefined ? timestamp(start) + timestamp(duration) : perf.now();
+    const startTime = start !== undefined ? timestamp(start) :
+      duration !== undefined && end !== undefined ? timestamp(end) - timestamp(duration) : 0;
+    const entry = Object.create(PerformanceMeasure.prototype);
+    entryState.set(entry, {name, entryType: 'measure', startTime, duration: endTime - startTime,
+      detail: detail === undefined ? null : _structuredClone(detail, new Map())});
+    return record(entry);
+  };
+  function clear(type, name) {
+    name = name === undefined ? undefined : string(name);
+    buffers[type] = name === undefined ? [] : buffers[type].filter(entry => entryState.get(entry).name !== name);
+    if (type === 'mark') {
+      if (name === undefined) latestMarks.clear();
+      else latestMarks.delete(name);
+    }
+  }
+  perf.clearMarks = function clearMarks(name = undefined) { checkPerformance(this); clear('mark', name); };
+  perf.clearMeasures = function clearMeasures(name = undefined) { checkPerformance(this); clear('measure', name); };
+  perf.getEntries = function getEntries() { checkPerformance(this); return entries(allEntries()); };
+  perf.getEntriesByType = function getEntriesByType(type) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('An entry type is required');
+    type = string(type);
+    return entries(buffers[type] || []);
+  };
+  perf.getEntriesByName = function getEntriesByName(name, type = undefined) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('An entry name is required');
+    return entries(allEntries(), string(name), type === undefined ? undefined : string(type));
+  };
+  globalThis.PerformanceObserverEntryList = class PerformanceObserverEntryList {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    getEntries() { return entries(state(listState, this)); }
+    getEntriesByType(type) {
+      const buffer = state(listState, this);
+      if (!arguments.length) throw new TypeError('An entry type is required');
+      return entries(buffer, undefined, string(type));
+    }
+    getEntriesByName(name, type = undefined) {
+      const buffer = state(listState, this);
+      if (!arguments.length) throw new TypeError('An entry name is required');
+      return entries(buffer, string(name), type === undefined ? undefined : string(type));
+    }
+  };
+  globalThis.PerformanceObserver = class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError('An observer callback is required');
+      observerState.set(this, {callback, records: [], types: new Set(), mode: undefined, requiresDroppedEntries: false});
+    }
+    observe(options = {}) {
+      const data = state(observerState, this);
+      options = dictionary(options);
+      const buffered = options.buffered;
+      const entryTypes = options.entryTypes;
+      const rawType = options.type;
+      const type = rawType === undefined ? undefined : string(rawType);
+      if (entryTypes === undefined && type === undefined) throw new TypeError('An entry type is required');
+      if (entryTypes !== undefined && (type !== undefined || buffered !== undefined)) throw new TypeError('Invalid observer options');
+      let types;
+      if (entryTypes !== undefined) {
+        if (entryTypes == null || (typeof entryTypes !== 'object' && typeof entryTypes !== 'function')) throw new TypeError('Expected a sequence');
+        if (typeof entryTypes[Symbol.iterator] !== 'function') throw new TypeError('Expected a sequence');
+        types = Array.from(entryTypes, string);
+      } else types = [type];
+      const mode = entryTypes === undefined ? 'single' : 'multiple';
+      if (data.mode !== undefined && data.mode !== mode) throw new DOMException('Cannot change observer mode', 'InvalidModificationError');
+      data.mode = mode;
+      data.requiresDroppedEntries = true;
+      types = types.filter(value => supported.includes(value));
+      if (!types.length) return;
+      if (mode === 'multiple') data.types = new Set(types);
+      else data.types.add(type);
+      observers.add(this);
+      if (buffered) {
+        for (const entry of buffers[type]) data.records.push(entry);
+        if (data.records.length) queueDelivery();
+      }
+    }
+    disconnect() {
+      const data = state(observerState, this);
+      observers.delete(this);
+      data.records = [];
+      data.types.clear();
+    }
+    takeRecords() {
+      const data = state(observerState, this);
+      const records = data.records;
+      data.records = [];
+      return records;
+    }
+    static get supportedEntryTypes() { return supported; }
+  };
+  for (const name of ['mark', 'measure', 'clearMarks', 'clearMeasures', 'getEntries', 'getEntriesByType', 'getEntriesByName']) {
+    Object.defineProperty(Performance.prototype, name, Object.getOwnPropertyDescriptor(perf, name));
+    delete perf[name];
+  }
+  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
+    Object.defineProperty(globalThis, name, {enumerable: false});
+    const proto = globalThis[name].prototype;
+    Object.defineProperty(proto, Symbol.toStringTag, {value: name, configurable: true});
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key !== 'constructor') Object.defineProperty(proto, key, {...Object.getOwnPropertyDescriptor(proto, key), enumerable: true});
+    }
+  }
+})();
 
 var _commonFonts = [
   'Arial', 'Arial Black', 'Arial Narrow',
@@ -16468,11 +16749,18 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  // A navigation start precedes the wall clock, so skew into the past only: an
-  // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
-  globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  const timing = {};
+  for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
+    Object.defineProperty(timing, name, {
+      enumerable: true, get() { return +_dom('performance_timing', name); },
+    });
+  }
+  Object.defineProperty(globalThis.performance, 'timeOrigin', {
+    configurable: true, value: +_dom('performance_time_origin'), writable: false,
+  });
+  Object.defineProperty(globalThis.performance, 'timing', {
+    configurable: true, value: timing, writable: false,
+  });
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,
