@@ -38,6 +38,15 @@ const items = await page.$$eval('.item', els => els.map(el => ({
 })));
 ```
 
+## SVG element interfaces
+
+SVG nodes created with `document.createElementNS` or parsed from SVG markup
+expose their corresponding interfaces, such as `SVGImageElement` and
+`SVGUseElement`, with prototype ancestry from the [SVG IDL](https://svgwg.org/svg2-draft/idl.html)
+and [Filter Effects IDL](https://www.w3.org/TR/filter-effects-1/#svg-interfaces). This supports interface
+checks in page scripts; it does not imply support for every SVG property,
+method or rendering feature.
+
 ## Interact
 
 ```js
@@ -81,6 +90,21 @@ await page.route('**/*', route => {
   }
 });
 ```
+
+## JavaScript heap measurements
+
+```js
+const client = await context.newCDPSession(page);
+await client.send('HeapProfiler.collectGarbage'); // Optional explicit collection.
+const heap = await client.send('Runtime.getHeapUsage');
+console.log(heap.usedSize, heap.totalSize, heap.backingStorageSize);
+await client.detach();
+```
+
+These are native V8 isolate byte counts, not process memory. Reading them does
+not run page tasks or force collection. `embedderHeapUsedSize` is zero because
+Obscura's Rust DOM is not a V8-managed cppgc heap; Rust allocations and renderer
+memory are not included.
 
 ## Multiple pages
 
