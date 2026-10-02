@@ -106,6 +106,20 @@ not run page tasks or force collection. `embedderHeapUsedSize` is zero because
 Obscura's Rust DOM is not a V8-managed cppgc heap; Rust allocations and renderer
 memory are not included.
 
+## Application timing
+
+Page scripts can record `performance.mark()` and `performance.measure()`
+entries, retrieve them through the timeline getters, and observe them through
+`PerformanceObserver`, including buffered delivery. Measurement options accept
+named marks or numeric timestamps; `detail` is structured-cloned.
+
+`PerformanceObserver.supportedEntryTypes` reports `mark` and `measure` only.
+Navigation, resource, paint, and long-task entries are not emitted. User Timing
+entries remain available until cleared or the realm is destroyed; applications
+that continuously record timings should call `clearMarks()` and `clearMeasures()`.
+Legacy `performance.timing` is still incomplete; measurements using navigation
+milestone names are not yet reliable.
+
 ## Multiple pages
 
 ```js
