@@ -6323,16 +6323,22 @@ class Document extends Node {
       // document.write's parser-blocking queue may still be fetching a
       // classic script. It must finish before DOMContentLoaded is observable.
       if (__parserBlockingScriptPending > 0) { setTimeout(finishParsing, 1); return; }
+      _dom('performance_lifecycle', 'domInteractive');
       globalThis.__documentReadyState__ = 'interactive';
       this.dispatchEvent(new Event('readystatechange'));
+      _dom('performance_lifecycle', 'domContentLoadedEventStart');
       this.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+      _dom('performance_lifecycle', 'domContentLoadedEventEnd');
       _dom('document_lifecycle', 'DOMContentLoaded');
       const complete = () => {
         if (generation !== this._writeGeneration) return;
         if (__dynLoadDelayingPending > 0) { setTimeout(complete, 1); return; }
+        _dom('performance_lifecycle', 'domComplete');
         globalThis.__documentReadyState__ = 'complete';
         this.dispatchEvent(new Event('readystatechange'));
+        _dom('performance_lifecycle', 'loadEventStart');
         globalThis.dispatchEvent(new Event('load'));
+        _dom('performance_lifecycle', 'loadEventEnd');
         _dom('document_lifecycle', 'load');
       };
       complete();
@@ -16743,11 +16749,18 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  // A navigation start precedes the wall clock, so skew into the past only: an
-  // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
-  globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  const timing = {};
+  for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
+    Object.defineProperty(timing, name, {
+      enumerable: true, get() { return +_dom('performance_timing', name); },
+    });
+  }
+  Object.defineProperty(globalThis.performance, 'timeOrigin', {
+    configurable: true, value: +_dom('performance_time_origin'), writable: false,
+  });
+  Object.defineProperty(globalThis.performance, 'timing', {
+    configurable: true, value: timing, writable: false,
+  });
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,

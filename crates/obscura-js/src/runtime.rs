@@ -2400,10 +2400,23 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
+        self.state.borrow_mut().navigation_timing.record("domLoading");
         let _ = self.execute_runtime_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+    }
+
+    pub fn navigation_timing(&self) -> crate::ops::NavigationTiming {
+        self.state.borrow().navigation_timing.clone()
+    }
+
+    pub fn set_navigation_timing(&self, timing: crate::ops::NavigationTiming) {
+        self.state.borrow_mut().navigation_timing = timing;
+    }
+
+    pub fn record_navigation_timing(&self, name: &str) {
+        self.state.borrow_mut().navigation_timing.record(name);
     }
 
     /// Override the coordinates the navigator.geolocation shim reports. The
@@ -6399,6 +6412,36 @@ mod tests {
             Some(0.0),
             "performance.now() went backwards"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_close_navigation_timing_records_real_lifecycle_only_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate("performance.timing.loadEventEnd").unwrap().as_f64(), Some(0.0));
+        rt.execute_script("document-close-timing", r#"
+            document.open();
+            globalThis.samples = [];
+            document.addEventListener('DOMContentLoaded', () => samples.push([
+                performance.timing.domContentLoadedEventStart, performance.timing.domContentLoadedEventEnd]));
+            window.addEventListener('load', () => samples.push([
+                performance.timing.loadEventStart, performance.timing.loadEventEnd]));
+            Date.now = () => 0;
+            document.write('<p>Written document</p>'); document.close();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const [dom, load] = samples;
+            const end = performance.timing.loadEventEnd;
+            const origin = performance.timeOrigin;
+            window.dispatchEvent(new Event('load'));
+            document.open(); document.write('<p>Written again</p>'); document.close();
+            return [dom[0] > 0 && dom[1] === 0, load[0] > 0 && load[1] === 0,
+                end >= load[0], performance.timing.loadEventEnd === end,
+                performance.timeOrigin === origin];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true]));
+        let before = rt.evaluate("[performance.timeOrigin, performance.timing.loadEventEnd]").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[performance.timeOrigin, performance.timing.loadEventEnd]").unwrap(), before);
     }
 
     #[tokio::test(flavor = "current_thread")]

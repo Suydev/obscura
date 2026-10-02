@@ -117,8 +117,17 @@ named marks or numeric timestamps; `detail` is structured-cloned.
 Navigation, resource, paint, and long-task entries are not emitted. User Timing
 entries remain available until cleared or the realm is destroyed; applications
 that continuously record timings should call `clearMarks()` and `clearMeasures()`.
-Legacy `performance.timing` is still incomplete; measurements using navigation
-milestone names are not yet reliable.
+Legacy `performance.timing` records main-document navigation start, fetch start,
+response completion and DOM/load milestones. Event-end values remain zero until
+their handlers finish. These read-only, integer epoch timestamps use a native
+monotonic clock and share the real origin with `performance.timeOrigin`; they
+survive runtime suspension and are not replaced by synthetic events or
+`document.open()`/`close()`. Named User Timing measures can use these milestones.
+Transport response completion is observed when the buffered fetch returns.
+DNS, connection, TLS, first-byte, redirect and previous-document unload timings
+remain unavailable rather than fabricated. Child realms record their own DOM
+and load milestones, but do not yet receive the fetch's start/completion metadata.
+This is partial legacy timing support, not Navigation Timing conformance.
 
 ## Multiple pages
 

@@ -109,6 +109,44 @@ pub(crate) struct CanvasBackingSurface {
     pub pixels: JsBuffer,
 }
 
+const NAVIGATION_TIMING_FIELDS: [&str; 10] = [
+    "navigationStart", "fetchStart", "responseEnd", "domLoading", "domInteractive",
+    "domContentLoadedEventStart", "domContentLoadedEventEnd", "domComplete",
+    "loadEventStart", "loadEventEnd",
+];
+
+/// Observed document milestones, anchored once to the epoch and advanced by
+/// the monotonic clock. Unavailable transport details are not synthesized.
+#[derive(Clone)]
+pub struct NavigationTiming {
+    pub time_origin: f64,
+    origin: std::time::Instant,
+    values: [u64; 10],
+}
+
+impl Default for NavigationTiming {
+    fn default() -> Self {
+        let origin = std::time::Instant::now();
+        let time_origin = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1_000.0;
+        let mut values = [0; 10];
+        values[0] = time_origin as u64;
+        Self { time_origin, origin, values }
+    }
+}
+
+impl NavigationTiming {
+    pub fn record(&mut self, name: &str) {
+        if let Some(index) = NAVIGATION_TIMING_FIELDS.iter().position(|field| *field == name) {
+            // document.open/close and synthetic events must not replace the
+            // first navigation's already-completed milestones.
+            if self.values[index] == 0 {
+                self.values[index] = (self.time_origin + self.origin.elapsed().as_secs_f64() * 1_000.0) as u64;
+            }
+        }
+    }
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -124,6 +162,7 @@ pub struct ObscuraState {
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
     pub referrer: String,
+    pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
@@ -384,6 +423,7 @@ impl ObscuraState {
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
+            navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
@@ -1668,6 +1708,24 @@ fn op_dom(
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "performance_time_origin" {
+        return shared.borrow().navigation_timing.time_origin.to_string();
+    }
+    if cmd == "performance_timing" {
+        let state = shared.borrow();
+        let timing = &state.navigation_timing;
+        if arg1.is_empty() {
+            let values: serde_json::Map<String, serde_json::Value> = NAVIGATION_TIMING_FIELDS
+                .iter().zip(timing.values).map(|(name, value)| (name.to_string(), value.into())).collect();
+            return serde_json::Value::Object(values).to_string();
+        }
+        return NAVIGATION_TIMING_FIELDS.iter().position(|field| *field == arg1)
+            .map(|index| timing.values[index].to_string()).unwrap_or_else(|| "null".into());
+    }
+    if cmd == "performance_lifecycle" {
+        shared.borrow_mut().navigation_timing.record(&arg1);
+        return "null".into();
+    }
     if cmd == "document_lifecycle" {
         let mut state = shared.borrow_mut();
         // Page lifecycle collection is independent of Runtime.enable.
