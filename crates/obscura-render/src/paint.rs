@@ -1587,7 +1587,7 @@ impl PreparedRender {
             let Some(rect) = self.viewport_rect_with_scroll(id, scroll) else {
                 continue;
             };
-            if x < rect.x || x > rect.x + rect.width || y < rect.y || y > rect.y + rect.height {
+            if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
                 continue;
             }
             if scroll
@@ -12003,6 +12003,30 @@ mod tests {
     use crate::dom::layout_dom_with_web_fonts;
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
+
+    #[test]
+    fn hit_testing_excludes_bottom_and_right_box_edges() {
+        for placement in ["left:10px;top:10px", "left:0;top:0;transform:translate(10px,10px)"] {
+            let tree = parse_html(&format!(r#"<style>
+                body {{margin:0}}
+                #under {{position:absolute;left:0;top:0;width:100px;height:100px}}
+                #over {{position:absolute;{placement};width:20px;height:20px;z-index:2}}
+                </style><div id="under"></div><div id="over"></div>"#));
+            let mut cache = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let under = tree.get_element_by_id("under").unwrap();
+            let over = tree.get_element_by_id("over").unwrap();
+            for (x, y, expected) in [
+                (10.0, 20.0, over), (20.0, 10.0, over),
+                (29.999, 20.0, over), (20.0, 29.999, over),
+                (30.0, 20.0, under), (20.0, 30.0, under), (30.0, 30.0, under),
+            ] {
+                assert_eq!(prepared.hit_test(&tree, &scroll, x, y), Some(expected),
+                    "{placement}, point ({x}, {y})");
+            }
+        }
+    }
 
     // #1019: a near-singular transform over content far larger than the viewport
     // makes one element's transform layer unallocatable. It must skip that
