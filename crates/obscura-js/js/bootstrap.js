@@ -10642,6 +10642,19 @@ globalThis.KeyboardEvent = class extends Event {
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
+const _browserErrorEvent = globalThis.ErrorEvent;
+__obscuraCore.setReportExceptionCallback(error => {
+  // deno_core's default reporter terminates execution, discarding the rest of
+  // the microtask checkpoint. Browser callback errors must leave queued work live.
+  let message;
+  try { message = String(error?.message ?? error); }
+  catch (_) { message = "Uncaught exception"; }
+  const event = new _browserErrorEvent("error", { message, error, cancelable: true });
+  if (_eventTargetDispatch(globalThis, event)) {
+    __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
+    _consoleFn("error", [error]);
+  }
+});
 globalThis.PointerEvent = class extends MouseEvent {
   constructor(t,o={}) {
     super(t,o);
