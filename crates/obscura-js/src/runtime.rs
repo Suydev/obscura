@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, RuntimeExceptionEvent, StoredNetworkResponseBody,
+    ObscuraState, RuntimeEvent, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -1347,61 +1347,7 @@ impl ObscuraJsRuntime {
     }
 
     fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
-        let mut state = self.state.borrow_mut();
-        if !state.runtime_events_enabled {
-            return;
-        }
-        state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
-        let first = error.frames.first();
-        let url = first
-            .and_then(|frame| frame.file_name.clone())
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| fallback_url.to_string());
-        let line_number = first
-            .and_then(|frame| frame.line_number)
-            .unwrap_or(1)
-            .saturating_sub(1);
-        let column_number = first
-            .and_then(|frame| frame.column_number)
-            .unwrap_or(1)
-            .saturating_sub(1);
-        let stack_trace = error
-            .frames
-            .iter()
-            .map(|frame| {
-                serde_json::json!({
-                    "functionName": frame.function_name.as_deref().unwrap_or(""),
-                    "scriptId": "",
-                    "url": frame.file_name.as_deref().unwrap_or(fallback_url),
-                    "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
-                    "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
-                })
-            })
-            .collect();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1_000.0;
-        if state.pending_runtime_events.len() >= 1_024 {
-            state.pending_runtime_events.pop_front();
-        }
-        let exception_id = state.runtime_exception_counter;
-        state
-            .pending_runtime_events
-            .push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
-                exception_id,
-                name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
-                description: error
-                    .stack
-                    .clone()
-                    .unwrap_or_else(|| error.exception_message.clone()),
-                url,
-                line_number,
-                column_number,
-                stack_trace,
-                timestamp,
-            }));
+        crate::ops::record_uncaught_exception(&mut self.state.borrow_mut(), error, fallback_url);
     }
 
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
@@ -5414,6 +5360,55 @@ mod tests {
             rt.evaluate("__taskOrder").unwrap(),
             serde_json::json!(["sync", "microtask", "timer"])
         );
+    }
+
+    #[tokio::test]
+    async fn microtask_exception_reports_error_without_discarding_queued_work() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"(() => {
+            globalThis.microtaskOrder = [];
+            const failure = new Error('fixture microtask failure');
+            addEventListener('error', event => {
+                microtaskOrder.push(event.error === failure ? 'error' : 'wrong-error');
+                event.preventDefault();
+            });
+            queueMicrotask(() => microtaskOrder.push('before'));
+            queueMicrotask(() => { throw failure; });
+            queueMicrotask(() => microtaskOrder.push('after'));
+            Promise.resolve().then(() => microtaskOrder.push('promise'));
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("microtaskOrder").unwrap(),
+            serde_json::json!(["before", "error", "after", "promise"]));
+    }
+
+    #[tokio::test]
+    async fn microtask_exception_reports_only_uncanceled_runtime_errors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.reportedMicrotaskErrors = [];
+            addEventListener('error', event => {
+                reportedMicrotaskErrors.push(event.message);
+                if (event.message === 'canceled failure') event.preventDefault();
+            });
+            queueMicrotask(() => { throw new TypeError('uncanceled failure'); });
+            queueMicrotask(() => { throw new Error('canceled failure'); });
+            queueMicrotask(() => reportedMicrotaskErrors.push('after'));
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("reportedMicrotaskErrors").unwrap(),
+            serde_json::json!(["uncanceled failure", "canceled failure", "after"]));
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].name, "TypeError");
+        assert!(exceptions[0].description.contains("uncanceled failure"));
     }
 
     #[tokio::test(flavor = "current_thread")]
