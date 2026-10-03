@@ -14,11 +14,13 @@ async fn serve_fixture() -> String {
         let mut buf = [0u8; 2048];
         let _ = socket.read(&mut buf).await.unwrap();
         let body = r#"<!doctype html><html><head><style>
-          input { display: block; width: 40px; height: 40px; margin: 10px }
+          input, label { display: block; width: 40px; height: 40px; margin: 10px }
         </style></head><body>
           <input id="box" type="checkbox">
           <input id="first" type="radio" name="choice" checked>
           <input id="second" type="radio" name="choice">
+          <label id="box-label" for="box">Checkbox</label>
+          <label id="second-label" for="second">Radio</label>
           <script>
             window.writes = []; window.events = []; window.cancel = false;
             for (const id of ['box', 'first', 'second']) {
@@ -135,9 +137,9 @@ async fn activate(ctx: &mut CdpContext, sid: &str, id: &str, pointer: bool) {
     }
 }
 
-async fn verify_activation(pointer: bool) {
+async fn verify_activation(pointer: bool, label: bool) {
     let (mut ctx, sid) = setup().await;
-    activate(&mut ctx, &sid, "box", pointer).await;
+    activate(&mut ctx, &sid, if label { "box-label" } else { "box" }, pointer).await;
     let s = snapshot(&mut ctx, &sid).await;
     assert_eq!(s["writes"], json!([]), "native activation must bypass author setters: {s}");
     assert_eq!(s["box"], true);
@@ -146,7 +148,7 @@ async fn verify_activation(pointer: bool) {
         ["box", "click", true, false], ["box", "input", true, false], ["box", "change", true, false]
     ]));
     evaluate(&mut ctx, 30, "events = []", &sid).await;
-    activate(&mut ctx, &sid, "second", pointer).await;
+    activate(&mut ctx, &sid, if label { "second-label" } else { "second" }, pointer).await;
     let s = snapshot(&mut ctx, &sid).await;
     assert_eq!(s["writes"], json!([]), "radio peers must bypass author setters: {s}");
     assert_eq!(s["first"], false);
@@ -160,11 +162,11 @@ async fn verify_activation(pointer: bool) {
     assert_eq!(s["box"], false);
 }
 
-async fn verify_cancellation(pointer: bool) {
+async fn verify_cancellation(pointer: bool, label: bool) {
     let (mut ctx, sid) = setup().await;
     evaluate(&mut ctx, 10, "cancel = true", &sid).await;
-    activate(&mut ctx, &sid, "box", pointer).await;
-    activate(&mut ctx, &sid, "second", pointer).await;
+    activate(&mut ctx, &sid, if label { "box-label" } else { "box" }, pointer).await;
+    activate(&mut ctx, &sid, if label { "second-label" } else { "second" }, pointer).await;
     let s = snapshot(&mut ctx, &sid).await;
     assert_eq!(s["writes"], json!([]), "activation and rollback bypass author setters: {s}");
     assert_eq!(s["box"], false);
@@ -177,10 +179,18 @@ async fn verify_cancellation(pointer: bool) {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn native_pointer_activation_bypasses_author_setters() { verify_activation(true).await; }
+async fn native_pointer_activation_bypasses_author_setters() { verify_activation(true, false).await; }
 #[tokio::test(flavor = "current_thread")]
-async fn element_click_activation_bypasses_author_setters() { verify_activation(false).await; }
+async fn element_click_activation_bypasses_author_setters() { verify_activation(false, false).await; }
 #[tokio::test(flavor = "current_thread")]
-async fn native_pointer_cancellation_restores_internal_state() { verify_cancellation(true).await; }
+async fn native_pointer_cancellation_restores_internal_state() { verify_cancellation(true, false).await; }
 #[tokio::test(flavor = "current_thread")]
-async fn element_click_cancellation_restores_internal_state() { verify_cancellation(false).await; }
+async fn element_click_cancellation_restores_internal_state() { verify_cancellation(false, false).await; }
+#[tokio::test(flavor = "current_thread")]
+async fn native_label_activation_bypasses_author_setters() { verify_activation(true, true).await; }
+#[tokio::test(flavor = "current_thread")]
+async fn element_label_activation_bypasses_author_setters() { verify_activation(false, true).await; }
+#[tokio::test(flavor = "current_thread")]
+async fn native_label_cancellation_restores_internal_state() { verify_cancellation(true, true).await; }
+#[tokio::test(flavor = "current_thread")]
+async fn element_label_cancellation_restores_internal_state() { verify_cancellation(false, true).await; }

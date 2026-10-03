@@ -87,6 +87,10 @@ enum Command {
         #[arg(long, default_value_t = obscura_cdp::DEFAULT_MAX_CONNECTIONS)]
         max_connections: usize,
 
+        /// Atomically publish the bound address after V8 initialization.
+        #[arg(long, value_name = "PATH")]
+        ready_file: Option<std::path::PathBuf>,
+
         /// Allow CDP clients to navigate to file:// URLs. Off by
         /// default so a CDP connection cannot read arbitrary local
         /// files. Enable only when serving local HTML for testing
@@ -409,6 +413,7 @@ async fn run_cli() -> anyhow::Result<()> {
             user_agent,
             workers,
             max_connections,
+            ready_file,
             allow_file_access,
             storage_dir,
             font_dirs,
@@ -423,7 +428,12 @@ async fn run_cli() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
             });
             configure_font_directories(&font_dirs)?;
-            print_banner(port);
+            if ready_file.is_some() && workers != 1 {
+                anyhow::bail!("--ready-file requires --workers 1");
+            }
+            if port != 0 {
+                print_banner(port);
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -458,7 +468,7 @@ async fn run_cli() -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_serve_options_limit_and_ready_file(
                     port,
                     &host,
                     proxy,
@@ -468,6 +478,7 @@ async fn run_cli() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    ready_file.as_deref(),
                 )
                 .await?;
             }
@@ -856,6 +867,10 @@ async fn run_fetch(
         allow_private_network,
     );
     context.obey_robots = obey_robots;
+    // The browser layer refuses file:// unless the context opts in. A local
+    // user running `obscura fetch file://...` on their own files is the
+    // intended case; only network-facing servers (serve, mcp) keep it off.
+    context.allow_file_access = true;
     let context = Arc::new(context);
     let mut page = Page::new("fetch-page".to_string(), context.clone());
     // Keep the browser's end-to-end navigation ceiling aligned with the CLI

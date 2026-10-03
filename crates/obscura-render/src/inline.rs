@@ -2495,7 +2495,7 @@ fn collect_node_spans(
     c: &mut Collector,
     loaded_families: &HashMap<String, LoadedFamily>,
 ) {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return;
     };
     match &node.data {
@@ -3188,7 +3188,7 @@ fn inline_child_ok(
     styles: &std::collections::HashMap<NodeId, LayoutStyle>,
     has_text: &mut bool,
 ) -> bool {
-    let Some(node) = tree.get_node(cid) else {
+    let Some(node) = tree.borrow_node(cid) else {
         return true;
     };
     match &node.data {

@@ -22,6 +22,11 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_stealth', '__obscura_markTrusted', '__obscura_core_handoff',
+    // Created by later evaluation, input and emulation paths. Register them
+    // before the snapshot hide list is captured, just like the other internals.
+    '__obscura_await_rejected', '__obscura_click_target',
+    '__obscura_screen_emulated', '__obscura_screen_w', '__obscura_screen_h',
+    '__obscura_viewport_w', '__obscura_viewport_h',
     '__obscura_frameId', '__obscura_parentFrameId', '__obscura_frameWindows',
     '__obscura_frameObjects', '__obscura_frameElements', '__obscura_deliverMessage',
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
@@ -63,13 +68,38 @@ const __obscuraCore = globalThis.Deno.core;
     'Navigator', 'PluginArray', 'Plugin', 'MimeType', 'MimeTypeArray',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'CSSRule', 'CSSStyleRule', 'CSSGroupingRule',
+    'CSSRuleList', 'StyleSheet', 'StyleSheetList', 'CSSStyleSheet',
+    'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
     'SVGElement', 'SVGGraphicsElement', 'SVGGeometryElement', 'SVGPathElement',
-    'SVGSVGElement',
+    'SVGSVGElement', 'SVGGElement', 'SVGDefsElement', 'SVGSymbolElement',
+    'SVGUseElement', 'SVGMarkerElement', 'SVGAElement', 'SVGSwitchElement',
+    'SVGImageElement', 'SVGForeignObjectElement', 'SVGRectElement',
+    'SVGCircleElement', 'SVGEllipseElement', 'SVGLineElement',
+    'SVGPolylineElement', 'SVGPolygonElement', 'SVGTextElement',
+    'SVGTSpanElement', 'SVGTextPathElement',
+    'SVGTextContentElement', 'SVGTextPositioningElement', 'SVGGradientElement',
+    'SVGLinearGradientElement', 'SVGRadialGradientElement', 'SVGStopElement',
+    'SVGClipPathElement', 'SVGMaskElement', 'SVGPatternElement',
+    'SVGFilterElement', 'SVGScriptElement', 'SVGStyleElement', 'SVGViewElement',
+    'SVGTitleElement', 'SVGDescElement', 'SVGMetadataElement',
+    'SVGAnimationElement', 'SVGAnimateElement',
+    'SVGAnimateMotionElement', 'SVGAnimateTransformElement', 'SVGSetElement',
+    'SVGComponentTransferFunctionElement',
+    'SVGFEFuncRElement', 'SVGFEFuncGElement', 'SVGFEFuncBElement',
+    'SVGFEFuncAElement', 'SVGFEBlendElement', 'SVGFEColorMatrixElement',
+    'SVGFEComponentTransferElement', 'SVGFECompositeElement',
+    'SVGFEConvolveMatrixElement', 'SVGFEDiffuseLightingElement',
+    'SVGFEDisplacementMapElement', 'SVGFEDistantLightElement',
+    'SVGFEDropShadowElement', 'SVGFEFloodElement', 'SVGFEGaussianBlurElement',
+    'SVGFEImageElement', 'SVGFEMergeElement', 'SVGFEMergeNodeElement',
+    'SVGFEMorphologyElement', 'SVGFEOffsetElement', 'SVGFEPointLightElement',
+    'SVGFESpecularLightingElement', 'SVGFESpotLightElement', 'SVGFETileElement',
+    'SVGFETurbulenceElement',
   ];
   var _desc = { value: undefined, writable: true, enumerable: false, configurable: true };
   for (var _i = 0; _i < _names.length; _i++) {
@@ -154,6 +184,10 @@ const _dom = (cmd, a1, a2) => {
   // not make JS believe a move happened.
   if (result === "true" && _DOM_TREE_MUTATION_COMMANDS.has(cmd)) {
     _treeMutationEpoch++;
+    // HTML removal steps reset the focused area to the viewport without
+    // dispatching blur/change events. Cover native replacement paths too.
+    const focused = globalThis.__obscura_focused;
+    if (focused && !focused.isConnected) globalThis.__obscura_focused = null;
   }
   return result;
 };
@@ -1779,14 +1813,33 @@ class CSSStyleDeclaration {
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  // CSSOM: the style attribute is only rewritten when the declaration
+  // changed. Rewriting it on a no-op set queued a mutation record, so a
+  // MutationObserver that re-applies the same style re-triggered itself
+  // forever (a page pinning body `top: 0` spun at 100% CPU).
   setProperty(name, value) {
     this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
+    const old = this._props[k];
+    if (value === "" || value == null) {
+      if (old === undefined) return;
+      delete this._props[k];
+    } else {
+      value = String(value);
+      if (old === value) return;
+      this._props[k] = value;
+    }
     this._push();
   }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  removeProperty(name) {
+    this._pull();
+    const k = _cssCamelToKebab(String(name));
+    const old = this._props[k];
+    if (old === undefined) return "";
+    delete this._props[k];
+    this._push();
+    return old;
+  }
   getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() { this._pull(); return _serializeCss(this._props); }
@@ -1945,6 +1998,15 @@ function _eventTargetDispatch(target, event) {
   event.currentTarget = target;
   event.eventPhase = 2;
   try {
+    // Other EventTargets register their IDL handlers in the listener list.
+    const eventHandler = target === globalThis ? target['on' + event.type] : null;
+    if (typeof eventHandler === 'function') {
+      try {
+        if (eventHandler.call(target, event) === false) event.preventDefault();
+      } catch (error) {
+        console.error(error);
+      }
+    }
     const listeners = (_eventTargetListeners.get(target)?.get(String(event.type)) || []).slice();
     for (const entry of listeners) {
       const current = _eventTargetListeners.get(target)?.get(String(event.type));
@@ -2029,7 +2091,10 @@ function _domEventDispatch(target, event) {
     path.push(ancestor);
     ancestor = ancestor.parentNode || null;
   }
-  if (target !== globalThis && path[path.length - 1] !== globalThis) {
+  // Detached nodes have no event parent. Connected paths reach Window through
+  // Document, except for load, whose Document parent is null by specification.
+  const reachesDocument = target === document || path[path.length - 1] === document;
+  if (reachesDocument && event.type !== "load") {
     path.push(globalThis);
   }
 
@@ -2379,12 +2444,7 @@ class Node {
       );
     }
     const removedWindowNames = _windowNamedNamesInTree(c);
-    if (c instanceof Element && _linkedStylesheetNodes.has(c)) {
-      __obscuraCore.ops.op_external_stylesheet_remove(
-        c._nid, globalThis.__obscura_frameId || 0
-      );
-      _linkedStylesheetNodes.delete(c);
-    }
+    if (c instanceof Element) _releaseLinkedStylesheetsIn(c);
     const parentConnected = this.isConnected;
     const removed = _dom("remove_child", c._nid) === "true";
     if (!removed) {
@@ -3058,7 +3118,9 @@ globalThis.__obscura_interactiveHost = function(el) {
 // Frozen so page script can neither replace the helpers to suppress or fake
 // label activation, nor delete them and make later clicks throw.
 for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
-                     '__obscura_labeledControl', '__obscura_interactiveHost']) {
+                     '__obscura_labeledControl', '__obscura_interactiveHost',
+                     '__obscura_inputChecked', '__obscura_setInputChecked',
+                     '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate']) {
   Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
 }
 
@@ -3478,6 +3540,62 @@ function _animationsForTarget(target) {
   });
 }
 
+const _innerTextBlockDisplays = new Set([
+  'block', 'flow-root', 'flex', 'grid', 'list-item', 'table', 'table-caption',
+]);
+
+function _collectInnerText(node, items, inheritedVisibility = 'visible') {
+  if (node.nodeType === 3) {
+    if (inheritedVisibility === 'visible') items.push(node.data ?? '');
+    return;
+  }
+  if (node.nodeType !== 1) return;
+
+  const style = getComputedStyle(node);
+  const display = style.display;
+  if (display === 'none') return;
+  const visibility = style.visibility || inheritedVisibility;
+  if (visibility === 'visible' && node.tagName === 'BR') {
+    items.push('\n');
+    return;
+  }
+  const breaks = visibility === 'visible'
+    ? (node.tagName === 'P' ? 2 : (_innerTextBlockDisplays.has(display) ? 1 : 0))
+    : 0;
+  if (breaks) items.push(breaks);
+  for (const child of node.childNodes) {
+    _collectInnerText(child, items, visibility);
+  }
+  if (visibility !== 'visible') return;
+  if (display === 'table-cell') items.push('\t');
+  if (display === 'table-row') items.push('\n');
+  if (breaks) items.push(breaks);
+}
+
+function _renderedInnerText(element) {
+  const items = [];
+  for (const child of element.childNodes) {
+    _collectInnerText(child, items);
+  }
+  let result = '';
+  let pendingBreaks = 0;
+  for (const item of items) {
+    if (typeof item === 'number') {
+      pendingBreaks = Math.max(pendingBreaks, item);
+      continue;
+    }
+    const text = item === '\n' || item === '\t'
+      ? item
+      : String(item).replace(/[\t\n\f\r ]+/g, ' ');
+    if (!text || (pendingBreaks && text === ' ')) continue;
+    if (pendingBreaks && result) result += '\n'.repeat(pendingBreaks);
+    pendingBreaks = 0;
+    result += text;
+  }
+  return result.replace(/ +/g, ' ').replace(/ *\n */g, '\n')
+    .replace(/^[ \n\t]+|[ \n\t]+$/g, '');
+}
+
 class Element extends Node {
   constructor(nid) {
     const entry = _customElementConstructionStack[_customElementConstructionStack.length - 1];
@@ -3501,6 +3619,10 @@ class Element extends Node {
   // Element for element nodes, and node ids are never freed-and-reused), so this
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
   get nodeType() { return 1; }
+  // DOM wrappers must not carry Object's default brand. Libraries such as
+  // Swiper use Object.prototype.toString to distinguish plain option objects
+  // from host elements before recursively merging them.
+  get [Symbol.toStringTag]() { return "HTMLElement"; }
   get tagName() {
     // An element's qualified name is immutable for its lifetime. React reads
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
@@ -3569,6 +3691,7 @@ class Element extends Node {
     // descendant style sheets before the backing nodes leave the document so
     // retained CSSStyleSheet wrappers cannot keep stale owner/source nodes.
     for (const style of this.querySelectorAll("style")) _detachStyleSheet(style);
+    _releaseLinkedStylesheetsIn(this);
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
@@ -3586,7 +3709,12 @@ class Element extends Node {
     }
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
-  get innerText() { return this.textContent; }
+  get innerText() {
+    if (!this.isConnected
+        || typeof __obscuraCore.ops.op_computed_style !== 'function'
+        || getComputedStyle(this).display === 'none') return this.textContent;
+    return _renderedInnerText(this);
+  }
   set innerText(v) { this.textContent = v; }
   get children() {
     const ids = _domParse("element_children", this._nid) || [];
@@ -3924,6 +4052,12 @@ class Element extends Node {
     // private token so the forwarded events stay trusted. Read from arguments
     // to keep click.length at 0, as in a real browser.
     const _trusted = arguments[0] === _TRUSTED_ACTIVATION;
+    // A borrowed method must activate in the receiver's realm: node ids and
+    // private checkedness are local to each document.
+    if (_cache.get(this._nid) !== this) {
+      const activate = _documentRealmMember(this, 'activateElement');
+      if (activate) return activate.call(this, _trusted);
+    }
     // Pre-click activation steps (HTML spec): a checkbox/radio flips BEFORE the
     // click event dispatches, so listeners observe the new state, and the change
     // is reverted if the event is cancelled. This mirrors the CDP mouse path in
@@ -4381,6 +4515,26 @@ class Element extends Node {
       configurable: true
     });
   }
+  get label() {
+    if (this.localName === 'option') {
+      const label = this.getAttribute('label');
+      return label !== null ? label : this.textContent;
+    }
+    if (this.localName === 'optgroup') return this.getAttribute('label') || '';
+    return undefined;
+  }
+  set label(v) {
+    if (this.localName === 'option' || this.localName === 'optgroup') {
+      this.setAttribute('label', String(v));
+      return;
+    }
+    Object.defineProperty(this, 'label', {
+      value: v,
+      writable: true,
+      enumerable: true,
+      configurable: true
+    });
+  }
   get disabled() { return this.hasAttribute("disabled"); }
   set disabled(v) { if (v) this.setAttribute("disabled", ""); else this.removeAttribute("disabled"); }
   get type() {
@@ -4490,6 +4644,7 @@ class Element extends Node {
     if (oldId) {
       delete globalThis.__obscura_frameElements[oldId];
       delete globalThis.__obscura_frameWindows[oldId];
+      delete globalThis.__obscura_frameObjects[oldId];
     }
     this._frameId = 0;
     this._iframeLoadingUrl = null;
@@ -4526,6 +4681,7 @@ class Element extends Node {
         // document below stays: it is what the parent reads through
         // contentDocument.
         const box = el.getBoundingClientRect();
+        if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
           loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
@@ -4560,6 +4716,7 @@ class Element extends Node {
   }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
+    if (_ensureInitialFrameRealm(this) === false) return null;
     const real = _frameObjectsFor(this);
     if (real?.document) return real.document;
     if (this._iframeDoc) {
@@ -4581,6 +4738,7 @@ class Element extends Node {
   }
   get contentWindow() {
     if (this.localName !== 'iframe') return undefined;
+    if (_ensureInitialFrameRealm(this) === false) return null;
     if (_frameObjectsFor(this)) {
       const win = _frameWindowFor(this._frameId);
       if (win) return win;
@@ -4795,14 +4953,20 @@ class Element extends Node {
   }
   get offsetWidth() {
     if (this._isViewportRoot()) return globalThis.innerWidth || 1280;
-    return this.getBoundingClientRect().width;
+    const metrics = this._renderBoxMetrics();
+    return metrics ? metrics.offsetWidth : this.getBoundingClientRect().width;
   }
   get offsetHeight() {
     if (this._isViewportRoot()) return globalThis.innerHeight || 720;
-    return this.getBoundingClientRect().height;
+    const metrics = this._renderBoxMetrics();
+    return metrics ? metrics.offsetHeight : this.getBoundingClientRect().height;
   }
   get offsetParent() {
     if (!this.isConnected || this._renderBoxGeometry() === null) return null;
+    // CSSOM View: null for the root element and the body element. Returning
+    // document.body here made body.offsetParent === body, so the common
+    // `while (el) { x += el.offsetLeft; el = el.offsetParent; }` never ended.
+    if (this === document.documentElement || this === document.body) return null;
     const ownStyle = globalThis.getComputedStyle(this);
     if (ownStyle.position === 'fixed') return null;
 
@@ -4860,9 +5024,32 @@ class Element extends Node {
     return metrics ? metrics.height : 20;
   }
   _renderClientMetrics() {
+    const metrics = this._renderBoxMetrics();
+    return metrics ? { width: metrics.clientWidth, height: metrics.clientHeight } : metrics;
+  }
+  _renderBoxMetrics() {
+    if (typeof __obscuraCore.ops.op_layout_box_metrics === 'function') {
+      try {
+        const raw = __obscuraCore.ops.op_layout_box_metrics(String(this._nid | 0), _realmFrameId);
+        if (!raw) return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
+        const metrics = JSON.parse(raw);
+        if (metrics && Number.isFinite(metrics.clientWidth)
+            && Number.isFinite(metrics.clientHeight)
+            && Number.isFinite(metrics.offsetWidth)
+            && Number.isFinite(metrics.offsetHeight)) {
+          return {
+            clientWidth: Math.round(Math.max(0, metrics.clientWidth)),
+            clientHeight: Math.round(Math.max(0, metrics.clientHeight)),
+            offsetWidth: Math.round(Math.max(0, metrics.offsetWidth)),
+            offsetHeight: Math.round(Math.max(0, metrics.offsetHeight)),
+          };
+        }
+      } catch (_error) {}
+      return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
+    }
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return { width: 0, height: 0 };
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4872,12 +5059,14 @@ class Element extends Node {
         // subpixel precision for getBoundingClientRect(); client metrics round
         // to whole CSS pixels like Chromium.
         return {
-          width: Math.round(Math.max(0, geometry.clientWidth)),
-          height: Math.round(Math.max(0, geometry.clientHeight)),
+          clientWidth: Math.round(Math.max(0, geometry.clientWidth)),
+          clientHeight: Math.round(Math.max(0, geometry.clientHeight)),
+          offsetWidth: Math.round(Math.max(0, geometry.width)),
+          offsetHeight: Math.round(Math.max(0, geometry.height)),
         };
       }
     } catch (_error) {}
-    return { width: 0, height: 0 };
+    return { clientWidth: 0, clientHeight: 0, offsetWidth: 0, offsetHeight: 0 };
   }
   // `undefined` means this is a non-render build. `null` means the render
   // engine is present but this element has no associated CSS box (for
@@ -4887,7 +5076,7 @@ class Element extends Node {
   _renderBoxGeometry() {
     if (typeof __obscuraCore.ops.op_layout_geometry !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const geometry = JSON.parse(raw);
       if (geometry
@@ -4951,7 +5140,7 @@ class Element extends Node {
   _renderScrollMetrics() {
     if (typeof __obscuraCore.ops.op_layout_metrics !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_layout_metrics();
+      const raw = __obscuraCore.ops.op_layout_metrics(_realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4960,7 +5149,7 @@ class Element extends Node {
   _renderElementScrollMetrics() {
     if (typeof __obscuraCore.ops.op_element_scroll_metrics !== 'function') return undefined;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0));
+      const raw = __obscuraCore.ops.op_element_scroll_metrics(String(this._nid | 0), _realmFrameId);
       if (!raw) return null;
       const metrics = JSON.parse(raw);
       return metrics && metrics.hasBox !== false ? metrics : null;
@@ -4971,7 +5160,7 @@ class Element extends Node {
   _renderScrollOffset() {
     if (typeof __obscuraCore.ops.op_scroll_offset !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_scroll_offset();
+      const raw = __obscuraCore.ops.op_scroll_offset(_realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4980,7 +5169,7 @@ class Element extends Node {
   _setRenderScroll(x, y) {
     if (typeof __obscuraCore.ops.op_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_scroll_to(+x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_scroll_to(+x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -4989,7 +5178,7 @@ class Element extends Node {
   _setRenderElementScroll(x, y) {
     if (typeof __obscuraCore.ops.op_element_scroll_to !== 'function') return null;
     try {
-      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0);
+      const raw = __obscuraCore.ops.op_element_scroll_to(String(this._nid | 0), +x || 0, +y || 0, _realmFrameId);
       return raw ? JSON.parse(raw) : null;
     } catch (_e) {
       return null;
@@ -5154,23 +5343,22 @@ class Element extends Node {
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
   scrollIntoView(arg) {
-    globalThis.__obscura_click_target = this;
-    const rect = this.getBoundingClientRect();
-    // A viewport-fixed subtree is already expressed in the viewport's
-    // coordinate space and cannot be brought closer by moving the document.
-    if (rect.__obscuraViewportFixed) return;
-
     let block = "start", inline = "nearest";
     if (arg === false) block = "end";
     else if (arg && typeof arg === "object") {
       if (["start", "center", "end", "nearest"].includes(arg.block)) block = arg.block;
       if (["start", "center", "end", "nearest"].includes(arg.inline)) inline = arg.inline;
     }
-    const currentX = globalThis.scrollX || 0;
-    const currentY = globalThis.scrollY || 0;
-    const vw = globalThis.innerWidth || 1280;
-    const vh = globalThis.innerHeight || 720;
+    this._scrollIntoView(block, inline, false, arg && arg.behavior);
+  }
+  scrollIntoViewIfNeeded(centerIfNeeded = true) {
+    const alignment = centerIfNeeded ? "center" : "nearest";
+    this._scrollIntoView(alignment, alignment, true);
+  }
+  _scrollIntoView(block, inline, onlyIfNeeded, behavior) {
+    globalThis.__obscura_click_target = this;
     const align = (mode, start, end, size, viewportSize, current) => {
+      if (onlyIfNeeded && start >= 0 && end <= viewportSize) return current;
       if (mode === "start") return current + start;
       if (mode === "center") return current + start - (viewportSize - size) / 2;
       if (mode === "end") return current + end - viewportSize;
@@ -5179,13 +5367,41 @@ class Element extends Node {
       if ((start >= 0 && end <= viewportSize) || (start < 0 && end > viewportSize)) {
         return current;
       }
-      if (start < 0) return current + start;
-      if (end > viewportSize) return current + end - viewportSize;
+      if (start < 0) return current + (size <= viewportSize ? start : end - viewportSize);
+      if (end > viewportSize) return current + (size <= viewportSize ? end - viewportSize : start);
       return current;
     };
+    // Use the renderer's retained scroll ranges, not overflow guesses. A
+    // clipped/non-scrolling box has zero range even when descendants overflow.
+    const viewportFixed = this.getBoundingClientRect().__obscuraViewportFixed;
+    for (let ancestor = this.parentElement;
+         typeof __obscuraCore.ops.op_element_scroll_metrics === 'function' && ancestor && !ancestor._isViewportRoot();
+         ancestor = ancestor.parentElement) {
+      const metrics = ancestor._renderElementScrollMetrics();
+      if (metrics && (metrics.maxX > 0 || metrics.maxY > 0)) {
+        const rect = this.getBoundingClientRect();
+        const port = ancestor.getBoundingClientRect();
+        const x = port.left + ancestor.clientLeft;
+        const y = port.top + ancestor.clientTop;
+        ancestor.scrollTo({
+          left: align(inline, rect.left - x, rect.right - x, rect.width, metrics.clientWidth, metrics.x),
+          top: align(block, rect.top - y, rect.bottom - y, rect.height, metrics.clientHeight, metrics.y),
+          behavior,
+        });
+      }
+      // A fixed scrollport can scroll its contents, but moving ancestors
+      // outside its fixed containing block cannot bring the target into view.
+      if (viewportFixed && globalThis.getComputedStyle(ancestor).position === 'fixed') break;
+    }
+    const rect = this.getBoundingClientRect();
+    if (rect.__obscuraViewportFixed) return;
+    const currentX = globalThis.scrollX || 0;
+    const currentY = globalThis.scrollY || 0;
+    const vw = globalThis.innerWidth || 1280;
+    const vh = globalThis.innerHeight || 720;
     const left = align(inline, rect.left, rect.right, rect.width, vw, currentX);
     const top = align(block, rect.top, rect.bottom, rect.height, vh, currentY);
-    globalThis.scrollTo({ left, top, behavior: arg && arg.behavior });
+    globalThis.scrollTo({ left, top, behavior });
   }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
   // The setters fire a scroll event of their own, so suppress the per-axis ones
@@ -5548,7 +5764,10 @@ class Document extends Node {
     }
     title.textContent = value;
   }
-  get URL() { return _domParse("document_url") ?? ""; }
+  get URL() {
+    const get = _documentRealmMember(this, 'URL');
+    return get ? Reflect.apply(get, this, []) : (_domParse("document_url") ?? "");
+  }
   get documentURI() { return this.URL; }
   get domain() {
     return this === globalThis.document
@@ -5575,7 +5794,10 @@ class Document extends Node {
   get referrer() { return _domParse("document_referrer") ?? ""; }
   get location() { return globalThis.location; }
   set location(url) { __obscuraCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
-  get defaultView() { return globalThis; }
+  get defaultView() {
+    const get = _documentRealmMember(this, 'defaultView');
+    return get ? Reflect.apply(get, this, []) : globalThis;
+  }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
@@ -5607,7 +5829,10 @@ class Document extends Node {
     if (/\.(?:xml|svg)(?:[?#]|$)/i.test(url)) return "application/xml";
     return "text/html";
   }
-  get readyState() { return globalThis.__documentReadyState__ || 'complete'; }
+  get readyState() {
+    const get = _documentRealmMember(this, 'readyState');
+    return get ? Reflect.apply(get, this, []) : (globalThis.__documentReadyState__ || 'complete');
+  }
   get currentScript() {
     // Next.js / Turbopack chunk loader reads document.currentScript.src to
     // derive its base path. page.rs sets __currentScriptNid before each
@@ -5618,11 +5843,18 @@ class Document extends Node {
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
   getElementById(id) {
+    const method = _documentRealmMember(this, 'getElementById');
+    if (method) return Reflect.apply(method, this, [id]);
     const needle = String(id);
     return needle === "" ? null : _wrapEl(+_dom("get_element_by_id", needle));
   }
-  querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
+  querySelector(s) {
+    const method = _documentRealmMember(this, 'querySelector');
+    return method ? Reflect.apply(method, this, [s]) : _wrapEl(+_dom("query_selector", s));
+  }
   querySelectorAll(s) {
+    const method = _documentRealmMember(this, 'querySelectorAll');
+    if (method) return Reflect.apply(method, this, [s]);
     const ids = _domParse("query_selector_all", s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
@@ -6115,19 +6347,65 @@ class Document extends Node {
     this.write(args.join('') + '\n');
   }
   open() {
-    var body = this.body;
+    const method = _documentRealmMember(this, 'open');
+    if (method) return Reflect.apply(method, this, []);
+    // Native algorithms use the receiver's tree, not script-overridden getters.
+    const head = _wrapEl(+_dom('query_selector', 'head'));
+    if (head) head.innerHTML = '';
+    const body = _wrapEl(+_dom('query_selector', 'body'));
     if (body) body.innerHTML = '';
     // A new parse begins. Whatever the input stream still held is gone.
     _dom("document_write_reset");
     this._writeAnchorScript = 0;
     this._writeAnchorNid = 0;
+    this._writeGeneration = (this._writeGeneration || 0) + 1;
+    this._writeOpen = true;
+    globalThis.__documentReadyState__ = 'loading';
+    _dom('document_lifecycle', 'init');
     return this;
   }
   close() {
-    return;
+    const method = _documentRealmMember(this, 'close');
+    if (method) return Reflect.apply(method, this, []);
+    if (!this._writeOpen) return;
+    this._writeOpen = false;
+    const generation = this._writeGeneration;
+    const finishParsing = () => {
+      if (generation !== this._writeGeneration) return;
+      // document.write's parser-blocking queue may still be fetching a
+      // classic script. It must finish before DOMContentLoaded is observable.
+      if (__parserBlockingScriptPending > 0) { setTimeout(finishParsing, 1); return; }
+      _dom('performance_lifecycle', 'domInteractive');
+      globalThis.__documentReadyState__ = 'interactive';
+      this.dispatchEvent(new Event('readystatechange'));
+      _dom('performance_lifecycle', 'domContentLoadedEventStart');
+      this.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+      _dom('performance_lifecycle', 'domContentLoadedEventEnd');
+      _dom('document_lifecycle', 'DOMContentLoaded');
+      const complete = () => {
+        if (generation !== this._writeGeneration) return;
+        if (__dynLoadDelayingPending > 0) { setTimeout(complete, 1); return; }
+        _dom('performance_lifecycle', 'domComplete');
+        globalThis.__documentReadyState__ = 'complete';
+        this.dispatchEvent(new Event('readystatechange'));
+        _dom('performance_lifecycle', 'loadEventStart');
+        globalThis.dispatchEvent(new Event('load'));
+        _dom('performance_lifecycle', 'loadEventEnd');
+        _dom('document_lifecycle', 'load');
+      };
+      complete();
+    };
+    setTimeout(finishParsing, 0);
   }
   hasFocus() { return true; }
   execCommand() { return false; }
+}
+
+// Preserve the receiver realm's implementations even if a membrane remaps the
+// document's public prototype. The ordinary own-document path makes no op call.
+function _documentRealmMember(receiver, name) {
+  return receiver === globalThis.document ? undefined
+    : __obscuraCore.ops.op_document_realm_member(receiver, name, _realmFrameId);
 }
 
 class DocumentFragment extends Node {
@@ -6738,12 +7016,18 @@ function _elementClassFor(nid) {
   // namespace for possible SVG wrappers.
   if (tag && tag !== tag.toUpperCase()
       && _domParse("namespace_uri", nid) === "http://www.w3.org/2000/svg") {
-    if (tag === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (tag === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    const svgClass = _svgElementClasses[tag];
+    if (svgClass) return svgClass;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "INPUT" && globalThis.HTMLInputElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "input") return globalThis.HTMLInputElement;
   if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+  if (tag === "META" && globalThis.HTMLMetaElement
+      && _domParse("namespace_uri", nid) === "http://www.w3.org/1999/xhtml"
+      && _domParse("local_name", nid) === "meta") return globalThis.HTMLMetaElement;
   // Only HTML slots take part in slot assignment; a foreign-namespace "SLOT"
   // (createElementNS + cloneNode lands here) stays a plain Element.
   if (tag === "SLOT" && globalThis.HTMLSlotElement
@@ -6762,14 +7046,16 @@ function _elementClassForKnownName(namespace, qualifiedName) {
     ? qualifiedName.slice(qualifiedName.indexOf(":") + 1)
     : qualifiedName;
   if (namespace === "http://www.w3.org/2000/svg") {
-    if (localName === "path" && globalThis.SVGPathElement) return globalThis.SVGPathElement;
-    if (localName === "svg" && globalThis.SVGSVGElement) return globalThis.SVGSVGElement;
+    const svgClass = _svgElementClasses[localName];
+    if (svgClass) return svgClass;
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (localName === "input" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
     if (tag === "TEXTAREA" && globalThis.HTMLTextAreaElement) return globalThis.HTMLTextAreaElement;
+    if (localName === "meta" && globalThis.HTMLMetaElement) return globalThis.HTMLMetaElement;
     if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
@@ -7236,8 +7522,12 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  defGetter('language', function() { return globalThis.__obscura_language || "en-US"; });
+  defGetter('languages', function() {
+    const language = globalThis.__obscura_language || "en-US";
+    const base = language.split('-')[0];
+    return base !== language ? [language, base] : [language];
+  });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([
@@ -7340,8 +7630,10 @@ globalThis.__obscura_set_screen_override = function(w, h, emulated) {
     _applyScreenSize(w, h, !!emulated);
     return;
   }
-  delete globalThis.__obscura_screen_w;
-  delete globalThis.__obscura_screen_h;
+  // Keep the snapshot's writable, hidden slots when clearing an override.
+  // Deleting them makes page initialization recreate read-only properties.
+  globalThis.__obscura_screen_w = undefined;
+  globalThis.__obscura_screen_h = undefined;
   const fallback = _fp('screen');
   _applyScreenSize(fallback[0], fallback[1], !!emulated);
 };
@@ -7542,7 +7834,7 @@ globalThis.fetch = async (input, init = {}) => {
   const responseBody = respType === "opaque"
     ? null
     : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
-  const response = new Response(responseBody, {
+  const response = _createInternalResponse(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
@@ -7550,6 +7842,13 @@ globalThis.fetch = async (input, init = {}) => {
     url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
+  if (typeof parsed.bodyRid === 'number') {
+    // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
+    // stream backpressure rather than eagerly queuing every network chunk.
+    const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid);
+    promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
+    response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
+  }
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
       value: parsed.requestId,
@@ -7988,19 +8287,43 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
+let _createInternalResponse;
 if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status === undefined ? 200 : Number(init.status); this.statusText = init.statusText || '';
+  const internalResponseInit = {};
+  const _Response = globalThis.Response = class Response {
+    constructor(body, init = {}, internalInit) {
+      if (init == null) init = {};
+      if (typeof init !== 'object' && typeof init !== 'function') {
+        throw new TypeError('Response init must be a dictionary');
+      }
+      const internal = internalInit === internalResponseInit;
+      const headers = init.headers;
+      const status = init.status;
+      const statusText = init.statusText;
+      this.status = status === undefined ? 200 : (internal ? status : (+status & 0xffff));
+      this.statusText = statusText === undefined ? '' : `${statusText}`;
+      if (!internal) {
+        if (this.status < 200 || this.status > 599) throw new RangeError('Invalid response status');
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError('Invalid response statusText');
+        if (body != null && (this.status === 204 || this.status === 205 || this.status === 304)) {
+          throw new TypeError('Response status cannot have a body');
+        }
+      } else if (this.status === 204 || this.status === 205 || this.status === 304) {
+        body = null;
+      }
+      this._bodyBytes = _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      this.headers = new Headers(headers);
+      this.type = internal ? (init.type || 'default') : 'default';
+      this.url = internal ? (init.url || '') : '';
+      this.redirected = internal && !!init.redirected;
       // #818: body/bodyUsed. A null-body response (null or no body passed)
       // has body === null; every other body is a one-chunk stream, created
       // lazily so merely touching .body does not copy the bytes.
       this._bodyNull = body === null || body === undefined;
       this._bodyStream = null;
       this._bodyUsed = false;
+      this._fetchBody = null;
     }
     _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
@@ -8012,8 +8335,18 @@ if (typeof Response === 'undefined') {
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
-            if (this._bodyBytes.length) controller.enqueue(this._bodyBytes);
-            controller.close();
+            const deliver = (bytes) => {
+              if (bytes.length) controller.enqueue(bytes);
+              controller.close();
+            };
+            if (this._fetchBody) this._fetchBody.promise.then(deliver, error => controller.error(error));
+            else deliver(this._bodyBytes);
+          },
+          cancel: () => {
+            this._bodyUsed = true;
+            if (this._fetchBody && --this._fetchBody.resource.consumers === 0) {
+              __obscuraCore.ops.op_try_close(this._fetchBody.resource.rid);
+            }
           },
         });
         // bodyUsed flips the moment the stream is locked for reading
@@ -8034,15 +8367,39 @@ if (typeof Response === 'undefined') {
       return this._bodyStream;
     }
     get bodyUsed() { return this._bodyUsed; }
-    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._bodyBytes, this.headers); }
-    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._bodyBytes, this.headers)); }
-    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._bodyBytes); }
-    async blob() { this._consumeBody(); return new Blob([this._bodyBytes]); }
-    clone() { return new Response(this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected }); }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
+    async text() { this._consumeBody(); return _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers); }
+    async json() { this._consumeBody(); return JSON.parse(await _decodeBodyWithCharset(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes, this.headers)); }
+    async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
+    async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
+    clone() {
+      const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+      if (this._fetchBody) {
+        const promise = this._fetchBody.promise.then(bytes => bytes.slice());
+        promise.catch(() => {});
+        this._fetchBody.resource.consumers++;
+        copy._fetchBody = { promise, resource: this._fetchBody.resource };
+      }
+      return copy;
+    }
+    static error() { return _createInternalResponse(null, { status: 0, type: 'error' }); }
+    static redirect(url, status = 302) {
+      url = `${url}`;
+      status = +status & 0xffff;
+      const parsed = new URL(url, document.baseURI);
+      if (![301,302,303,307,308].includes(status)) throw new RangeError('Invalid redirect status');
+      return new Response(null, { status, headers: { Location: parsed.href } });
+    }
+    static json(data, init) {
+      const json = JSON.stringify(data);
+      if (json === undefined) throw new TypeError('Value is not JSON serializable');
+      const response = new Response(new TextEncoder().encode(json), init);
+      if (!response.headers.has('content-type')) response.headers.set('content-type', 'application/json');
+      return response;
+    }
   };
+  _createInternalResponse = (body, init) => new _Response(body, init, internalResponseInit);
+} else {
+  _createInternalResponse = (body, init) => new Response(body, init);
 }
 
 if (!Element.prototype.replaceWith) {
@@ -8191,7 +8548,7 @@ function _roMeasurement(target, suppliedGeometry, suppliedByBatch = false) {
   const hasRenderer = typeof __obscuraCore.ops.op_layout_geometry === "function";
   if (!suppliedByBatch && hasRenderer && target?._nid != null) {
     try {
-      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0));
+      const raw = __obscuraCore.ops.op_layout_geometry(String(target._nid | 0), _realmFrameId);
       geometry = raw ? JSON.parse(raw) : null;
     } catch (_error) {}
   }
@@ -8293,7 +8650,7 @@ function _roMeasurements(targets) {
   if (typeof bulk === "function"
       && targets.every(target => target?._nid != null)) {
     try {
-      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)));
+      const raw = bulk(JSON.stringify(targets.map(target => target._nid | 0)), _realmFrameId);
       const geometries = raw ? JSON.parse(raw) : null;
       if (Array.isArray(geometries) && geometries.length === targets.length) {
         for (let index = 0; index < targets.length; index++) {
@@ -8684,33 +9041,48 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
   };
 });
 // getComputedStyle() returns a fresh declaration object, but those objects all
-// observe the same computed style for an element until the document mutates.
+// observe the same computed style until the document or viewport changes.
 // Share the immutable native snapshot behind them. Frameworks routinely call
 // getComputedStyle() repeatedly on the same few roots; rebuilding and parsing
 // several hundred properties for every wrapper dominated real-page startup.
 const _computedStyleSnapshotCache = new WeakMap();
-globalThis.getComputedStyle = (el) => {
+globalThis.getComputedStyle = (el, pseudo = '') => {
   if (!el) el = document.body || {};
+  // Resolve foreign elements in their document's realm, including its live
+  // mutation epoch. Node ids and style caches are document-local.
+  const view = el.ownerDocument?.defaultView;
+  if (view && view !== globalThis && typeof view.getComputedStyle === 'function'
+      && view.getComputedStyle !== globalThis.getComputedStyle) {
+    return view.getComputedStyle(el, pseudo);
+  }
+  pseudo = String(pseudo || '').toLowerCase();
   const style = el?.style || el?._style || new CSSStyleDeclaration();
   // Render builds expose one immutable snapshot from the retained final
   // cascade/layout. The native snapshot is shared per element and epoch while
   // each call still returns a distinct, live CSSStyleDeclaration proxy.
   const cacheable = (typeof el === 'object' && el !== null) || typeof el === 'function';
-  let snapshot = cacheable ? _computedStyleSnapshotCache.get(el) : null;
+  let snapshot = !pseudo && cacheable ? _computedStyleSnapshotCache.get(el) : null;
   if (!snapshot) {
-    snapshot = { rendered: null, epoch: -1, names: [] };
-    if (cacheable) _computedStyleSnapshotCache.set(el, snapshot);
+    snapshot = { rendered: null, epoch: -1, viewportWidth: -1, viewportHeight: -1, names: [], complete: false };
+    if (!pseudo && cacheable) _computedStyleSnapshotCache.set(el, snapshot);
   }
-  const refreshRendered = () => {
+  const refreshRendered = (property = '') => {
+    const viewportWidth = globalThis.innerWidth, viewportHeight = globalThis.innerHeight;
     const hasRunningAnimation = typeof _animationsForTarget === 'function'
       && _animationsForTarget(el).some(animation => animation.playState === 'running');
-    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation) return;
+    if (snapshot.epoch === _domMutationEpoch && !hasRunningAnimation
+        && snapshot.viewportWidth === viewportWidth && snapshot.viewportHeight === viewportHeight
+        && (snapshot.complete || (property && snapshot.rendered
+            && Object.prototype.hasOwnProperty.call(snapshot.rendered, property)))) return;
     snapshot.epoch = _domMutationEpoch;
+    snapshot.viewportWidth = viewportWidth;
+    snapshot.viewportHeight = viewportHeight;
     snapshot.rendered = null;
+    snapshot.complete = true;
     if (typeof __obscuraCore.ops.op_computed_style === 'function' && el?._nid != null) {
       try {
-        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0));
-        snapshot.rendered = raw ? JSON.parse(raw) : null;
+        const raw = __obscuraCore.ops.op_computed_style(String(el._nid | 0), pseudo, property, _realmFrameId);
+        if (raw) [snapshot.complete, snapshot.rendered] = JSON.parse(raw);
       } catch (e) {}
     }
     snapshot.names = snapshot.rendered ? Object.keys(snapshot.rendered) : [];
@@ -8771,13 +9143,13 @@ globalThis.getComputedStyle = (el) => {
 
   const lookup = (rawProp) => {
     if (typeof rawProp !== 'string') return '';
-    refreshRendered();
     let kebab = rawProp.replace(/([A-Z])/g, '-$1').toLowerCase();
     // CSSOM camelCase vendor properties omit the punctuation from their JS
     // spelling (`webkitLineClamp`) but computed-property names retain it
     // (`-webkit-line-clamp`). Normalize the prefix once for every WebKit
     // property instead of adding per-property aliases to the native snapshot.
     if (kebab.startsWith('webkit-')) kebab = '-' + kebab;
+    refreshRendered(kebab);
     if (snapshot.rendered && Object.prototype.hasOwnProperty.call(snapshot.rendered, kebab))
       return snapshot.rendered[kebab];
     // Non-render builds and properties outside the renderer snapshot retain
@@ -9008,10 +9380,44 @@ class CSSRuleList {
 
 const _cssStyleSheetPrivate = new WeakMap();
 
-class CSSStyleSheet {
+class CSSGroupingRule extends CSSRule {
+  constructor(cssText = "", type = 0) {
+    super(cssText, type);
+    this._rules = [];
+    this._cssRules = new CSSRuleList(this);
+  }
+  _refreshFromOwner() {}
+  get cssRules() { return this._cssRules; }
+  insertRule(rule, index = 0) {
+    const idx = Number(index) >>> 0;
+    if (idx > this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
+    const parsed = _splitTopLevelCssRules(String(rule));
+    if (!parsed.valid || parsed.rules.length !== 1) throw new DOMException("The rule could not be parsed", "SyntaxError");
+    const child = _cssRuleFromText(parsed.rules[0]);
+    if (!child) throw new DOMException("The rule could not be parsed", "SyntaxError");
+    child._parentStyleSheet = this.parentStyleSheet;
+    this._rules.splice(idx, 0, child);
+    this.parentStyleSheet?._ruleChanged();
+    return idx;
+  }
+  deleteRule(index) {
+    const idx = Number(index) >>> 0;
+    if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
+    this._rules.splice(idx, 1);
+    this.parentStyleSheet?._ruleChanged();
+  }
+}
+
+class StyleSheet {
+  constructor() { this._disabled = false; }
+  get disabled() { return this._disabled; }
+  set disabled(value) { this._disabled = !!value; }
+}
+
+class CSSStyleSheet extends StyleSheet {
   constructor(_options) {
+    super();
     this.ownerRule = null;
-    this.disabled = false;
     this._ownerNode = null;
     this._sourceNode = null;
     this._sourceText = "";
@@ -9025,6 +9431,8 @@ class CSSStyleSheet {
       href: null,
       originClean: true,
       sourceText: "",
+      generation: -1,
+      cssom: false,
     });
   }
   get type() { return "text/css"; }
@@ -9044,6 +9452,8 @@ class CSSStyleSheet {
     state.href = null;
     state.originClean = true;
     state.sourceText = "";
+    state.generation = -1;
+    state.cssom = false;
     this._ownerNode = ownerNode;
     this._sourceNode = sourceNode;
     this._sourceText = null;
@@ -9055,6 +9465,8 @@ class CSSStyleSheet {
     state.href = href || null;
     state.originClean = false;
     state.sourceText = "";
+    state.generation = -1;
+    state.cssom = false;
     this._ownerNode = ownerNode;
     this._sourceNode = null;
     this._sourceText = "";
@@ -9070,10 +9482,14 @@ class CSSStyleSheet {
   }
   _refreshFromOwner() {
     const state = _cssStyleSheetPrivate.get(this);
-    if (!state) return;
+    if (!state || !(state.linked ? this._ownerNode : this._sourceNode)) return;
+    // Tracing iterates every rule. Copying the source for each item is O(n²).
+    // The host generations include native imports and their origin-clean state.
+    const generation = __obscuraCore.ops.op_stylesheet_generation(_realmFrameId, state.linked);
+    if (state.generation === generation) return;
+    state.generation = generation;
     let text;
     if (state.linked) {
-      if (!this._ownerNode) return;
       let loaded;
       try {
         loaded = JSON.parse(__obscuraCore.ops.op_external_stylesheet_get(
@@ -9090,10 +9506,11 @@ class CSSStyleSheet {
       }
       text = String(loaded.css || "");
     } else {
-      if (!this._sourceNode) return;
       text = this._sourceNode.textContent || "";
     }
-    if (text === state.sourceText) return;
+    if (text === state.sourceText && (!state.cssom ||
+        __obscuraCore.ops.op_cssom_stylesheet_has(this._ownerNode._nid, _realmFrameId))) return;
+    state.cssom = false;
     const parsed = _splitTopLevelCssRules(text);
     const rules = parsed.rules.map(_cssRuleFromText).filter(Boolean);
     this._setRules(rules);
@@ -9106,23 +9523,34 @@ class CSSStyleSheet {
     for (const rule of this._rules) rule._parentStyleSheet = this;
   }
   _serializeText() { return this._rules.map(rule => rule.cssText).join("\n"); }
-  _ruleChanged() {
-    const text = this._serializeText();
+  _ruleChanged(change) {
     const state = _cssStyleSheetPrivate.get(this);
-    if (state) state.sourceText = text;
-    this._sourceText = text;
     if (state?.linked && this._ownerNode) {
+      // ponytail: linked imports retain the existing whole-sheet write path;
+      // incremental writes need per-sheet host-import revision tracking.
+      const text = this._serializeText();
+      state.sourceText = text;
+      this._sourceText = text;
       __obscuraCore.ops.op_external_stylesheet_set(
-        this._ownerNode._nid,
-        text,
+        this._ownerNode._nid, text,
         state.href || globalThis.document?.URL || "about:blank",
-        true,
-        globalThis.__obscura_frameId || 0,
+        true, _realmFrameId,
       );
-    } else if (this._sourceNode && this._sourceNode.textContent !== text) {
-      this._sourceNode.textContent = text;
+    } else if (this._ownerNode) {
+      // Initialize once, then transfer just the inserted/deleted rules. DOM
+      // source remains unchanged, including its text nodes and observers.
+      const reset = !state.cssom || !change;
+      state.cssom = __obscuraCore.ops.op_cssom_stylesheet_update(
+        this._ownerNode._nid, reset ? 0 : change.index,
+        reset ? 0 : change.deleteCount,
+        reset ? this._rules.map(rule => rule.cssText) : change.rules,
+        reset, _realmFrameId,
+      );
     }
     _syncAdoptedStyleSheet(this);
+    if (state && (state.linked || this._sourceNode)) {
+      state.generation = __obscuraCore.ops.op_stylesheet_generation(_realmFrameId, state.linked);
+    }
   }
   insertRule(rule, index = 0) {
     if (arguments.length < 1) throw new TypeError("CSSStyleSheet.insertRule requires a rule");
@@ -9138,7 +9566,7 @@ class CSSStyleSheet {
     if (!cssRule) throw new DOMException("The rule could not be parsed", "SyntaxError");
     cssRule._parentStyleSheet = this;
     this._rules.splice(idx, 0, cssRule);
-    this._ruleChanged();
+    this._ruleChanged({index: idx, deleteCount: 0, rules: [cssRule.cssText]});
     return idx;
   }
   deleteRule(index) {
@@ -9149,7 +9577,7 @@ class CSSStyleSheet {
     if (idx >= this._rules.length) throw new DOMException("Rule index is out of range", "IndexSizeError");
     const [removed] = this._rules.splice(idx, 1);
     if (removed) removed._parentStyleSheet = null;
-    this._ruleChanged();
+    this._ruleChanged({index: idx, deleteCount: 1, rules: []});
   }
   addRule(selector, style, index) {
     this.insertRule(String(selector) + "{" + String(style) + "}", index ?? this._rules.length);
@@ -9194,6 +9622,7 @@ function _sheetForStyleElement(style) {
 function _detachStyleSheet(style) {
   const sheet = _styleElementSheets.get(style);
   if (!sheet) return;
+  __obscuraCore.ops.op_cssom_stylesheet_clear(style._nid, _realmFrameId);
   sheet._ownerNode = null;
   sheet._sourceNode = null;
   _styleElementSheets.delete(style);
@@ -9219,14 +9648,34 @@ function _sheetForLinkElement(link) {
 function _detachLinkedStyleSheet(link) {
   const sheet = _linkElementSheets.get(link);
   if (!sheet) return;
+  __obscuraCore.ops.op_cssom_stylesheet_clear(link._nid, _realmFrameId);
   sheet._ownerNode = null;
   sheet._sourceNode = null;
   _linkElementSheets.delete(link);
+}
+// Drop the native bytes a host-fetched linked sheet installed for `link`.
+// Node.removeChild used to be the only path that did this; innerHTML and the
+// removal of an ancestor bypassed it, so the native map kept every sheet an
+// SPA ever swapped out (and a recycled node id could inherit stale CSS).
+function _releaseLinkedStylesheet(link) {
+  if (!_linkedStylesheetNodes.has(link)) return;
+  _linkedStylesheetNodes.delete(link);
+  try {
+    __obscuraCore.ops.op_external_stylesheet_remove(link._nid, globalThis.__obscura_frameId || 0);
+  } catch (e) {}
+  _detachLinkedStyleSheet(link);
+}
+function _releaseLinkedStylesheetsIn(root) {
+  if (!root || root.nodeType !== 1 && root.nodeType !== 11) return;
+  if (root.nodeType === 1 && root.localName === "link") _releaseLinkedStylesheet(root);
+  if (!root.querySelectorAll) return;
+  for (const link of root.querySelectorAll("link")) _releaseLinkedStylesheet(link);
 }
 function _detachStyleSheetsInSubtree(root) {
   if (!root) return;
   if (root.nodeType === 1 && root.localName === "style") _detachStyleSheet(root);
   if (root.nodeType === 1 && root.localName === "link") _detachLinkedStyleSheet(root);
+  _releaseLinkedStylesheetsIn(root);
   if (!root.querySelectorAll) return;
   for (const style of root.querySelectorAll("style")) _detachStyleSheet(style);
   for (const link of root.querySelectorAll('link[rel~="stylesheet"]')) {
@@ -9288,7 +9737,9 @@ Object.defineProperty(Element.prototype, "sheet", {
 });
 globalThis.CSSRule = CSSRule;
 globalThis.CSSStyleRule = CSSStyleRule;
+globalThis.CSSGroupingRule = CSSGroupingRule;
 globalThis.CSSRuleList = CSSRuleList;
+globalThis.StyleSheet = StyleSheet;
 globalThis.CSSStyleSheet = CSSStyleSheet;
 globalThis.StyleSheetList = StyleSheetList;
 
@@ -9398,7 +9849,7 @@ globalThis.MutationObserver = class MutationObserver {
   }
   observe(target, options) {
     this._targets.push({ target, options: options || {} });
-    globalThis.__mutationObservers.push(this);
+    if (!globalThis.__mutationObservers.includes(this)) globalThis.__mutationObservers.push(this);
   }
   disconnect() {
     this._targets = [];
@@ -9461,6 +9912,8 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
+      if (type === 'attributes' && t.options.attributeFilter !== undefined
+          && !t.options.attributeFilter.includes(attributeName)) continue;
       if (root._nid === target_nid) { matched = true; break; }
       if (t.options.subtree) {
         // Walk parents until we hit the observed root or run off the tree.
@@ -9820,7 +10273,7 @@ function _ioMeasurements(elements) {
   const nativeElements = elements.filter(element => element?._nid != null);
   if (typeof bulk !== "function" || !nativeElements.length) return measurements;
   try {
-    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)));
+    const raw = bulk(JSON.stringify(nativeElements.map(element => element._nid | 0)), _realmFrameId);
     const geometries = raw ? JSON.parse(raw) : null;
     if (Array.isArray(geometries) && geometries.length === nativeElements.length) {
       for (let index = 0; index < nativeElements.length; index++) {
@@ -10077,12 +10530,6 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
-globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
-// Feature detection reads this static before deciding to observe anything;
-// absent it, supportedEntryTypes.includes(...) throws and instrumentation
-// bails. Report only types the engine can actually emit records for.
-PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
-_markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -10149,6 +10596,11 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
     if (desc && desc.set) { desc.set.call(el, value); return; }
   } catch (_e) {}
   el[field] = value;
+};
+globalThis.__obscura_setHovered = function(el) {
+  if (typeof __obscuraCore.ops.op_set_hovered === 'function') {
+    __obscuraCore.ops.op_set_hovered(el?._nid | 0, 0);
+  }
 };
 
 // Build a FileList-like object: an array with the DOM's `item(i)` accessor.
@@ -10254,7 +10706,7 @@ globalThis.MouseEvent = class extends Event {
   }
 };
 globalThis.KeyboardEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat; }
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.key=o.key||"";this.code=o.code||"";this.location=o.location||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.repeat=!!o.repeat;this.keyCode=o.keyCode||0;this.charCode=o.charCode||0;this.which=o.which||0; }
   getModifierState(key) {
     switch (String(key)) {
       case 'Alt': return this.altKey;
@@ -10389,10 +10841,6 @@ __obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
     cancelable: true,
   });
   globalThis.dispatchEvent(event);
-  if (typeof globalThis.onunhandledrejection === "function") {
-    try { globalThis.onunhandledrejection.call(globalThis, event); }
-    catch (error) { console.error(error); }
-  }
   // Browsers report an unhandled rejection without terminating the page's
   // event loop. Returning true tells deno_core that the host delivered it.
   return true;
@@ -10401,10 +10849,6 @@ __obscuraCore.setUnhandledPromiseRejectionHandler((promise, reason) => {
 __obscuraCore.setHandledPromiseRejectionHandler((promise, reason) => {
   const event = new PromiseRejectionEvent("rejectionhandled", { promise, reason });
   globalThis.dispatchEvent(event);
-  if (typeof globalThis.onrejectionhandled === "function") {
-    try { globalThis.onrejectionhandled.call(globalThis, event); }
-    catch (error) { console.error(error); }
-  }
 });
 
 globalThis.StorageEvent = class StorageEvent extends Event {
@@ -10998,9 +11442,7 @@ globalThis.performance = globalThis.performance || {
       return _last;
     };
   })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
+  clearResourceTimings(){},
   setResourceTimingBufferSize(){},
   timeOrigin: 0,
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
@@ -11011,6 +11453,289 @@ globalThis.performance = globalThis.performance || {
     usedJSHeapSize: 16781520,
   },
 };
+
+// User Timing entries belong to this realm. The registry gives marks/measures
+// an unlimited timeline: retain them until clearMarks/clearMeasures or teardown,
+// not an arbitrary cap that silently invalidates long-running measurements.
+(function() {
+  const perf = globalThis.performance;
+  globalThis.Performance = class Performance {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  };
+  Object.setPrototypeOf(perf, Performance.prototype);
+  const buffers = Object.assign(Object.create(null), {mark: [], measure: []});
+  const latestMarks = new Map();
+  const entryState = new WeakMap();
+  const observerState = new WeakMap();
+  const listState = new WeakMap();
+  const observers = new Set();
+  const entryKey = {};
+  const supported = Object.freeze(['mark', 'measure']);
+  const timingNames = new Set([
+    'navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading',
+    'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd',
+    'domComplete', 'loadEventStart', 'loadEventEnd',
+  ]);
+  let deliveryPending = false;
+  function state(map, receiver) {
+    const value = map.get(receiver);
+    if (!value) throw new TypeError('Illegal invocation');
+    return value;
+  }
+  function string(value) {
+    if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to a string');
+    return String(value);
+  }
+  function dictionary(value) {
+    if (value == null) return {};
+    if (typeof value !== 'object' && typeof value !== 'function') throw new TypeError('Expected a dictionary');
+    return value;
+  }
+  function number(value) {
+    const result = +value;
+    if (!Number.isFinite(result)) throw new TypeError('Timestamp must be finite');
+    return result;
+  }
+  function timestamp(value) {
+    if (typeof value === 'number') {
+      value = number(value);
+      if (value < 0) throw new TypeError('Timestamp must not be negative');
+      return value;
+    }
+    value = string(value);
+    if (timingNames.has(value)) {
+      if (value === 'navigationStart') return 0;
+      const time = perf.timing[value] || 0;
+      if (!time) throw new DOMException('Timing event has not occurred', 'InvalidAccessError');
+      return time - perf.timing.navigationStart;
+    }
+    const mark = latestMarks.get(value);
+    if (!mark) throw new DOMException('The mark does not exist: ' + value, 'SyntaxError');
+    return entryState.get(mark).startTime;
+  }
+  function entries(buffer, name, type) {
+    return buffer.filter(entry => {
+      const data = entryState.get(entry);
+      return (name === undefined || data.name === name) && (type === undefined || data.entryType === type);
+    }).sort((a, b) => entryState.get(a).startTime - entryState.get(b).startTime);
+  }
+  function allEntries() { return buffers.mark.concat(buffers.measure); }
+  function checkPerformance(receiver) {
+    if (receiver !== perf) throw new TypeError('Illegal invocation');
+  }
+  globalThis.PerformanceEntry = class PerformanceEntry {
+    constructor(key) { if (key !== entryKey) throw new TypeError('Illegal constructor'); }
+    get name() { return state(entryState, this).name; }
+    get entryType() { return state(entryState, this).entryType; }
+    get startTime() { return state(entryState, this).startTime; }
+    get duration() { return state(entryState, this).duration; }
+    toJSON() {
+      const data = state(entryState, this);
+      return {name: data.name, entryType: data.entryType, startTime: data.startTime, duration: data.duration, detail: data.detail};
+    }
+  };
+  globalThis.PerformanceMark = class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      super(entryKey);
+      if (!arguments.length) throw new TypeError('A mark name is required');
+      name = string(name);
+      options = dictionary(options);
+      const detail = options.detail;
+      const start = options.startTime;
+      const startTime = start === undefined ? perf.now() : number(start);
+      if (timingNames.has(name)) throw new DOMException('Reserved timing name: ' + name, 'SyntaxError');
+      if (startTime < 0) throw new TypeError('Timestamp must not be negative');
+      entryState.set(this, {name, entryType: 'mark', startTime, duration: 0,
+        detail: detail === undefined ? null : _structuredClone(detail, new Map())});
+    }
+    get detail() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'mark') throw new TypeError('Illegal invocation');
+      return data.detail;
+    }
+  };
+  globalThis.PerformanceMeasure = class PerformanceMeasure extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get detail() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'measure') throw new TypeError('Illegal invocation');
+      return data.detail;
+    }
+  };
+  function queueDelivery() {
+    if (deliveryPending) return;
+    deliveryPending = true;
+    // Reuse browser posted tasks: asynchronous delivery without a timer-wheel
+    // delay or polling, cancelled at the document-generation boundary.
+    _browserPostedTaskEnqueue(() => {
+      deliveryPending = false;
+      for (const observer of Array.from(observers)) {
+        const data = observerState.get(observer);
+        if (!data.records.length) continue;
+        const list = Object.create(PerformanceObserverEntryList.prototype);
+        listState.set(list, data.records);
+        data.records = [];
+        const options = data.requiresDroppedEntries ? {droppedEntriesCount: 0} : {};
+        data.requiresDroppedEntries = false;
+        try { data.callback.call(observer, list, observer, options); }
+        catch (error) { globalThis.reportError(error); }
+      }
+    }, 0, _browserPostedTaskGeneration(), () => {
+      deliveryPending = false;
+      for (const observer of observers) observerState.get(observer).records = [];
+    });
+  }
+  function record(entry) {
+    const data = entryState.get(entry);
+    buffers[data.entryType].push(entry);
+    if (data.entryType === 'mark') {
+      const previous = latestMarks.get(data.name);
+      if (!previous || entryState.get(previous).startTime <= data.startTime) latestMarks.set(data.name, entry);
+    }
+    let notify = false;
+    for (const observer of observers) {
+      const observerData = observerState.get(observer);
+      if (observerData.types.has(data.entryType)) { observerData.records.push(entry); notify = true; }
+    }
+    if (notify) queueDelivery();
+    return entry;
+  }
+  perf.mark = function mark(name, options = {}) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A mark name is required');
+    return record(new PerformanceMark(name, options));
+  };
+  perf.measure = function measure(name, startOrOptions = {}, endMark) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A measure name is required');
+    name = string(name);
+    const isOptions = startOrOptions == null || typeof startOrOptions === 'object' || typeof startOrOptions === 'function';
+    let start, end, duration, detail;
+    if (isOptions) {
+      const options = dictionary(startOrOptions);
+      detail = options.detail;
+      const rawDuration = options.duration;
+      duration = rawDuration === undefined ? undefined : number(rawDuration);
+      end = options.end;
+      if (typeof end === 'number') end = number(end);
+      else if (end !== undefined) end = string(end);
+      start = options.start;
+      if (typeof start === 'number') start = number(start);
+      else if (start !== undefined) start = string(start);
+      if (start !== undefined || end !== undefined || duration !== undefined || detail !== undefined) {
+        if (endMark !== undefined || (start === undefined && end === undefined) ||
+            (start !== undefined && end !== undefined && duration !== undefined)) throw new TypeError('Invalid measure options');
+      }
+    } else start = string(startOrOptions);
+    if (endMark !== undefined) end = string(endMark);
+    const endTime = end !== undefined ? timestamp(end) :
+      start !== undefined && duration !== undefined ? timestamp(start) + timestamp(duration) : perf.now();
+    const startTime = start !== undefined ? timestamp(start) :
+      duration !== undefined && end !== undefined ? timestamp(end) - timestamp(duration) : 0;
+    const entry = Object.create(PerformanceMeasure.prototype);
+    entryState.set(entry, {name, entryType: 'measure', startTime, duration: endTime - startTime,
+      detail: detail === undefined ? null : _structuredClone(detail, new Map())});
+    return record(entry);
+  };
+  function clear(type, name) {
+    name = name === undefined ? undefined : string(name);
+    buffers[type] = name === undefined ? [] : buffers[type].filter(entry => entryState.get(entry).name !== name);
+    if (type === 'mark') {
+      if (name === undefined) latestMarks.clear();
+      else latestMarks.delete(name);
+    }
+  }
+  perf.clearMarks = function clearMarks(name = undefined) { checkPerformance(this); clear('mark', name); };
+  perf.clearMeasures = function clearMeasures(name = undefined) { checkPerformance(this); clear('measure', name); };
+  perf.getEntries = function getEntries() { checkPerformance(this); return entries(allEntries()); };
+  perf.getEntriesByType = function getEntriesByType(type) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('An entry type is required');
+    type = string(type);
+    return entries(buffers[type] || []);
+  };
+  perf.getEntriesByName = function getEntriesByName(name, type = undefined) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('An entry name is required');
+    return entries(allEntries(), string(name), type === undefined ? undefined : string(type));
+  };
+  globalThis.PerformanceObserverEntryList = class PerformanceObserverEntryList {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    getEntries() { return entries(state(listState, this)); }
+    getEntriesByType(type) {
+      const buffer = state(listState, this);
+      if (!arguments.length) throw new TypeError('An entry type is required');
+      return entries(buffer, undefined, string(type));
+    }
+    getEntriesByName(name, type = undefined) {
+      const buffer = state(listState, this);
+      if (!arguments.length) throw new TypeError('An entry name is required');
+      return entries(buffer, string(name), type === undefined ? undefined : string(type));
+    }
+  };
+  globalThis.PerformanceObserver = class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError('An observer callback is required');
+      observerState.set(this, {callback, records: [], types: new Set(), mode: undefined, requiresDroppedEntries: false});
+    }
+    observe(options = {}) {
+      const data = state(observerState, this);
+      options = dictionary(options);
+      const buffered = options.buffered;
+      const entryTypes = options.entryTypes;
+      const rawType = options.type;
+      const type = rawType === undefined ? undefined : string(rawType);
+      if (entryTypes === undefined && type === undefined) throw new TypeError('An entry type is required');
+      if (entryTypes !== undefined && (type !== undefined || buffered !== undefined)) throw new TypeError('Invalid observer options');
+      let types;
+      if (entryTypes !== undefined) {
+        if (entryTypes == null || (typeof entryTypes !== 'object' && typeof entryTypes !== 'function')) throw new TypeError('Expected a sequence');
+        if (typeof entryTypes[Symbol.iterator] !== 'function') throw new TypeError('Expected a sequence');
+        types = Array.from(entryTypes, string);
+      } else types = [type];
+      const mode = entryTypes === undefined ? 'single' : 'multiple';
+      if (data.mode !== undefined && data.mode !== mode) throw new DOMException('Cannot change observer mode', 'InvalidModificationError');
+      data.mode = mode;
+      data.requiresDroppedEntries = true;
+      types = types.filter(value => supported.includes(value));
+      if (!types.length) return;
+      if (mode === 'multiple') data.types = new Set(types);
+      else data.types.add(type);
+      observers.add(this);
+      if (buffered) {
+        for (const entry of buffers[type]) data.records.push(entry);
+        if (data.records.length) queueDelivery();
+      }
+    }
+    disconnect() {
+      const data = state(observerState, this);
+      observers.delete(this);
+      data.records = [];
+      data.types.clear();
+    }
+    takeRecords() {
+      const data = state(observerState, this);
+      const records = data.records;
+      data.records = [];
+      return records;
+    }
+    static get supportedEntryTypes() { return supported; }
+  };
+  for (const name of ['mark', 'measure', 'clearMarks', 'clearMeasures', 'getEntries', 'getEntriesByType', 'getEntriesByName']) {
+    Object.defineProperty(Performance.prototype, name, Object.getOwnPropertyDescriptor(perf, name));
+    delete perf[name];
+  }
+  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
+    Object.defineProperty(globalThis, name, {enumerable: false});
+    const proto = globalThis[name].prototype;
+    Object.defineProperty(proto, Symbol.toStringTag, {value: name, configurable: true});
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key !== 'constructor') Object.defineProperty(proto, key, {...Object.getOwnPropertyDescriptor(proto, key), enumerable: true});
+    }
+  }
+})();
 
 var _commonFonts = [
   'Arial', 'Arial Black', 'Arial Narrow',
@@ -11260,13 +11985,53 @@ globalThis.atob = globalThis.atob || ((s) => {
 (() => {
   const stack = [{state: null, url: undefined}]; // initial entry; url=undefined means "use document URL"
   let idx = 0;
+  // The page owns the tab's session history. `stack` covers only this
+  // document's entries; entries before it and after the current one come
+  // from the page, and a push drops the forward ones as the page will.
+  let forwardCleared = false;
+  const session = () => {
+    try {
+      const [start, current, length] = String(__obscuraCore.ops.op_session_history())
+        .split(",").map(Number);
+      if (length > 0) {
+        return {start, current, before: start,
+          after: forwardCleared ? 0 : Math.max(0, length - 1 - current)};
+      }
+    } catch (e) {}
+    return {start: 0, current: 0, before: 0, after: 0};
+  };
   const historyToken = Symbol("History");
-  const resolveOrFallback = (url) => {
+  const resolveHistoryUrl = (url, method) => {
     // A missing url (pushState/replaceState called with < 3 args) keeps the
     // current document URL per the HTML spec — capture it so the entry does not
     // reset location back to the original document URL.
     if (url === null || url === undefined) return __currentUrl();
-    try { return new URL(String(url), __currentUrl()).href; } catch (e) { return String(url); }
+    const base = __currentUrl();
+    let target;
+    try {
+      target = new URL(String(url), base);
+    } catch (e) {
+      // HTML spec: a URL that fails to parse throws a SecurityError.
+      throw new DOMException(
+        "Failed to execute '" + method + "' on 'History': Invalid URL '" + String(url) + "'.",
+        "SecurityError"
+      );
+    }
+    // Same-origin restriction (HTML spec): pushState/replaceState may only
+    // rewrite the URL within the document's origin. Without this a page could
+    // spoof its own URL to a cross-origin or file:// value, which the host then
+    // adopts as page.url via sync_virtual_url (#1055). Opaque-origin documents
+    // (about:blank, file:) have no comparable origin, so they are left as-is.
+    let baseUrl = null;
+    try { baseUrl = new URL(base); } catch (e) {}
+    if (baseUrl && baseUrl.origin && baseUrl.origin !== "null" && target.origin !== baseUrl.origin) {
+      throw new DOMException(
+        "Failed to execute '" + method + "' on 'History': A history state object with URL '" +
+          target.href + "' cannot be created in a document with origin '" + baseUrl.origin + "'.",
+        "SecurityError"
+      );
+    }
+    return target.href;
   };
   const applyVirtual = () => {
     const entry = stack[idx];
@@ -11288,7 +12053,10 @@ globalThis.atob = globalThis.atob || ((s) => {
     constructor(token) {
       if (token !== historyToken) throw new TypeError("Illegal constructor");
     }
-    get length() { return stack.length; }
+    get length() {
+      const {before, after} = session();
+      return before + stack.length + after;
+    }
     get state() { return stack[idx].state; }
     get scrollRestoration() { return this._scrollRestoration || "auto"; }
     set scrollRestoration(value) {
@@ -11299,18 +12067,19 @@ globalThis.atob = globalThis.atob || ((s) => {
     }
     pushState(state, _title, url) {
       const prevUrl = __currentUrl();
-      const resolved = resolveOrFallback(url);
+      const resolved = resolveHistoryUrl(url, 'pushState');
       // Truncate forward entries (real Chrome drops the forward stack on a
       // new push) then append + advance.
       stack.length = idx + 1;
       stack.push({state: state ?? null, url: resolved});
       idx = stack.length - 1;
+      forwardCleared = true;
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
     }
     replaceState(state, _title, url) {
       const prevUrl = __currentUrl();
-      const resolved = resolveOrFallback(url);
+      const resolved = resolveHistoryUrl(url, 'replaceState');
       stack[idx] = {state: state ?? null, url: resolved};
       applyVirtual();
       fireHashChangeIfNeeded(prevUrl);
@@ -11318,8 +12087,18 @@ globalThis.atob = globalThis.atob || ((s) => {
     go(n) {
       n = (n | 0);
       if (n === 0) return; // real spec: go(0) reloads. We don't reload SPAs.
-      const next = Math.max(0, Math.min(stack.length - 1, idx + n));
-      if (next === idx) return;
+      const target = idx + n;
+      if (target < 0 || target >= stack.length) {
+        // Another document's entry: the page loads it and moves its cursor.
+        const {start, current, before, after} = session();
+        if (target < 0 && -target <= before) {
+          __obscuraCore.ops.op_history_traverse(start + target);
+        } else if (target >= stack.length && target - (stack.length - 1) <= after) {
+          __obscuraCore.ops.op_history_traverse(current + target - (stack.length - 1));
+        }
+        return;
+      }
+      const next = target;
       const prevUrl = __currentUrl();
       idx = next;
       applyVirtual();
@@ -12015,7 +12794,12 @@ globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = Element;
+globalThis.HTMLInputElement = class HTMLInputElement extends Element {};
+// Framework value trackers read own prototype descriptors, not inherited ones.
+Object.defineProperties(HTMLInputElement.prototype, {
+  value: Object.getOwnPropertyDescriptor(Element.prototype, 'value'),
+  checked: Object.getOwnPropertyDescriptor(Element.prototype, 'checked'),
+});
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
@@ -12065,7 +12849,10 @@ globalThis.HTMLCanvasElement = Element;
 globalThis.HTMLScriptElement = Element;
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
-globalThis.HTMLMetaElement = Element;
+globalThis.HTMLMetaElement = class HTMLMetaElement extends Element {
+  get httpEquiv() { return this.getAttribute('http-equiv') || ''; }
+  set httpEquiv(value) { this.setAttribute('http-equiv', String(value)); }
+};
 globalThis.HTMLHeadElement = Element;
 globalThis.HTMLBodyElement = Element;
 globalThis.HTMLHtmlElement = Element;
@@ -12157,16 +12944,191 @@ Object.defineProperty(SVGAnimatedString.prototype, 'animVal', {
 Object.defineProperty(SVGAnimatedString.prototype, Symbol.toStringTag, { value: 'SVGAnimatedString', configurable: true });
 _markNative(SVGAnimatedString);
 
-class SVGElement extends Element {}
+class SVGElement extends Element {
+  get [Symbol.toStringTag]() { return "SVGElement"; }
+}
 class SVGGraphicsElement extends SVGElement {}
 class SVGGeometryElement extends SVGGraphicsElement {}
+class SVGTextContentElement extends SVGGraphicsElement {}
+class SVGTextPositioningElement extends SVGTextContentElement {}
+class SVGGradientElement extends SVGElement {}
+class SVGAnimationElement extends SVGElement {}
+class SVGComponentTransferFunctionElement extends SVGElement {}
 class SVGPathElement extends SVGGeometryElement {}
+class SVGRectElement extends SVGGeometryElement {}
+class SVGCircleElement extends SVGGeometryElement {}
+class SVGEllipseElement extends SVGGeometryElement {}
+class SVGLineElement extends SVGGeometryElement {}
+class SVGPolylineElement extends SVGGeometryElement {}
+class SVGPolygonElement extends SVGGeometryElement {}
+class SVGTextElement extends SVGTextPositioningElement {}
+class SVGTSpanElement extends SVGTextPositioningElement {}
+class SVGTextPathElement extends SVGTextContentElement {}
 class SVGSVGElement extends SVGGraphicsElement {}
+class SVGGElement extends SVGGraphicsElement {}
+class SVGDefsElement extends SVGGraphicsElement {}
+class SVGSymbolElement extends SVGGraphicsElement {}
+class SVGUseElement extends SVGGraphicsElement {}
+class SVGMarkerElement extends SVGElement {}
+class SVGAElement extends SVGGraphicsElement {}
+class SVGSwitchElement extends SVGGraphicsElement {}
+class SVGImageElement extends SVGGraphicsElement {}
+class SVGForeignObjectElement extends SVGGraphicsElement {}
+class SVGLinearGradientElement extends SVGGradientElement {}
+class SVGRadialGradientElement extends SVGGradientElement {}
+class SVGClipPathElement extends SVGElement {}
+class SVGMaskElement extends SVGElement {}
+class SVGPatternElement extends SVGElement {}
+class SVGFilterElement extends SVGElement {}
+class SVGScriptElement extends SVGElement {}
+class SVGStyleElement extends SVGElement {}
+class SVGViewElement extends SVGElement {}
+class SVGTitleElement extends SVGElement {}
+class SVGDescElement extends SVGElement {}
+class SVGMetadataElement extends SVGElement {}
+class SVGStopElement extends SVGElement {}
+class SVGAnimateElement extends SVGAnimationElement {}
+class SVGAnimateMotionElement extends SVGAnimationElement {}
+class SVGAnimateTransformElement extends SVGAnimationElement {}
+class SVGSetElement extends SVGAnimationElement {}
+class SVGFEFuncRElement extends SVGComponentTransferFunctionElement {}
+class SVGFEFuncGElement extends SVGComponentTransferFunctionElement {}
+class SVGFEFuncBElement extends SVGComponentTransferFunctionElement {}
+class SVGFEFuncAElement extends SVGComponentTransferFunctionElement {}
+// Filter and light-source interfaces inherit SVGElement. Transfer functions
+// use SVGComponentTransferFunctionElement and are declared above.
+const _feClasses = Object.create(null);
+for (const _feName of [
+  "Blend", "ColorMatrix", "ComponentTransfer", "Composite", "ConvolveMatrix",
+  "DiffuseLighting", "DisplacementMap", "DistantLight", "DropShadow", "Flood",
+  "GaussianBlur", "Image", "Merge", "MergeNode", "Morphology", "Offset",
+  "PointLight", "SpecularLighting", "SpotLight", "Tile", "Turbulence",
+]) {
+  class _FE extends SVGElement {}
+  Object.defineProperty(_FE, "name", { value: "SVGFE" + _feName + "Element" });
+  _feClasses[_feName] = _FE;
+  globalThis["SVGFE" + _feName + "Element"] = _FE;
+}
 globalThis.SVGElement = SVGElement;
 globalThis.SVGGraphicsElement = SVGGraphicsElement;
 globalThis.SVGGeometryElement = SVGGeometryElement;
+globalThis.SVGTextContentElement = SVGTextContentElement;
+globalThis.SVGTextPositioningElement = SVGTextPositioningElement;
+globalThis.SVGGradientElement = SVGGradientElement;
+globalThis.SVGAnimationElement = SVGAnimationElement;
+globalThis.SVGComponentTransferFunctionElement = SVGComponentTransferFunctionElement;
 globalThis.SVGPathElement = SVGPathElement;
+globalThis.SVGRectElement = SVGRectElement;
+globalThis.SVGCircleElement = SVGCircleElement;
+globalThis.SVGEllipseElement = SVGEllipseElement;
+globalThis.SVGLineElement = SVGLineElement;
+globalThis.SVGPolylineElement = SVGPolylineElement;
+globalThis.SVGPolygonElement = SVGPolygonElement;
+globalThis.SVGTextElement = SVGTextElement;
+globalThis.SVGTSpanElement = SVGTSpanElement;
+globalThis.SVGTextPathElement = SVGTextPathElement;
 globalThis.SVGSVGElement = SVGSVGElement;
+globalThis.SVGGElement = SVGGElement;
+globalThis.SVGDefsElement = SVGDefsElement;
+globalThis.SVGSymbolElement = SVGSymbolElement;
+globalThis.SVGUseElement = SVGUseElement;
+globalThis.SVGMarkerElement = SVGMarkerElement;
+globalThis.SVGAElement = SVGAElement;
+globalThis.SVGSwitchElement = SVGSwitchElement;
+globalThis.SVGImageElement = SVGImageElement;
+globalThis.SVGForeignObjectElement = SVGForeignObjectElement;
+globalThis.SVGLinearGradientElement = SVGLinearGradientElement;
+globalThis.SVGRadialGradientElement = SVGRadialGradientElement;
+globalThis.SVGClipPathElement = SVGClipPathElement;
+globalThis.SVGMaskElement = SVGMaskElement;
+globalThis.SVGPatternElement = SVGPatternElement;
+globalThis.SVGFilterElement = SVGFilterElement;
+globalThis.SVGScriptElement = SVGScriptElement;
+globalThis.SVGStyleElement = SVGStyleElement;
+globalThis.SVGViewElement = SVGViewElement;
+globalThis.SVGTitleElement = SVGTitleElement;
+globalThis.SVGDescElement = SVGDescElement;
+globalThis.SVGMetadataElement = SVGMetadataElement;
+globalThis.SVGStopElement = SVGStopElement;
+globalThis.SVGAnimateElement = SVGAnimateElement;
+globalThis.SVGAnimateMotionElement = SVGAnimateMotionElement;
+globalThis.SVGAnimateTransformElement = SVGAnimateTransformElement;
+globalThis.SVGSetElement = SVGSetElement;
+globalThis.SVGFEFuncRElement = SVGFEFuncRElement;
+globalThis.SVGFEFuncGElement = SVGFEFuncGElement;
+globalThis.SVGFEFuncBElement = SVGFEFuncBElement;
+globalThis.SVGFEFuncAElement = SVGFEFuncAElement;
+// Element interfaces keyed by the case-sensitive SVG local name the tree
+// reports: the HTML parser uppercases HTML tagName but preserves foreign
+// casing, so `linearGradient` and `clipPath` match as written. `_elementClassFor`
+// and `_elementClassForKnownName` both read this, so a parsed or created element
+// gets its standard interface and `instanceof` agrees with the constructor.
+// The prototype is null because these keys come from page markup, and a bare
+// `<constructor>` element must not resolve to `Object.prototype.constructor`.
+const _svgElementClasses = Object.assign(Object.create(null), {
+  a: SVGAElement,
+  animate: SVGAnimateElement,
+  animateMotion: SVGAnimateMotionElement,
+  animateTransform: SVGAnimateTransformElement,
+  circle: SVGCircleElement,
+  clipPath: SVGClipPathElement,
+  defs: SVGDefsElement,
+  desc: SVGDescElement,
+  ellipse: SVGEllipseElement,
+  feBlend: _feClasses.Blend,
+  feColorMatrix: _feClasses.ColorMatrix,
+  feComponentTransfer: _feClasses.ComponentTransfer,
+  feComposite: _feClasses.Composite,
+  feConvolveMatrix: _feClasses.ConvolveMatrix,
+  feDiffuseLighting: _feClasses.DiffuseLighting,
+  feDisplacementMap: _feClasses.DisplacementMap,
+  feDistantLight: _feClasses.DistantLight,
+  feDropShadow: _feClasses.DropShadow,
+  feFlood: _feClasses.Flood,
+  feFuncA: SVGFEFuncAElement,
+  feFuncB: SVGFEFuncBElement,
+  feFuncG: SVGFEFuncGElement,
+  feFuncR: SVGFEFuncRElement,
+  feGaussianBlur: _feClasses.GaussianBlur,
+  feImage: _feClasses.Image,
+  feMerge: _feClasses.Merge,
+  feMergeNode: _feClasses.MergeNode,
+  feMorphology: _feClasses.Morphology,
+  feOffset: _feClasses.Offset,
+  fePointLight: _feClasses.PointLight,
+  feSpecularLighting: _feClasses.SpecularLighting,
+  feSpotLight: _feClasses.SpotLight,
+  feTile: _feClasses.Tile,
+  feTurbulence: _feClasses.Turbulence,
+  filter: SVGFilterElement,
+  foreignObject: SVGForeignObjectElement,
+  g: SVGGElement,
+  image: SVGImageElement,
+  line: SVGLineElement,
+  linearGradient: SVGLinearGradientElement,
+  marker: SVGMarkerElement,
+  mask: SVGMaskElement,
+  metadata: SVGMetadataElement,
+  path: SVGPathElement,
+  pattern: SVGPatternElement,
+  polygon: SVGPolygonElement,
+  polyline: SVGPolylineElement,
+  radialGradient: SVGRadialGradientElement,
+  rect: SVGRectElement,
+  script: SVGScriptElement,
+  set: SVGSetElement,
+  stop: SVGStopElement,
+  style: SVGStyleElement,
+  svg: SVGSVGElement,
+  switch: SVGSwitchElement,
+  symbol: SVGSymbolElement,
+  text: SVGTextElement,
+  textPath: SVGTextPathElement,
+  title: SVGTitleElement,
+  tspan: SVGTSpanElement,
+  use: SVGUseElement,
+  view: SVGViewElement,
+});
 globalThis.CharacterData = CharacterData;
 globalThis.Text = Text;
 globalThis.Comment = Comment;
@@ -12986,7 +13948,7 @@ globalThis.__obscura_forgetFrame = function (frameId) {
 };
 
 function _realmOrigin() {
-  try { return new URL(_domParse('document_url')).origin; } catch (_) { return 'null'; }
+  return _domParse('document_origin') || 'null';
 }
 
 // Whether a postMessage restricted to `targetOrigin` may be delivered to a
@@ -13019,8 +13981,20 @@ function _sendRealmMessage(targetFrameId, data, targetOrigin) {
   // An unspecified targetOrigin stays permissive (empty string); the receiver
   // enforces a specified one against its own origin in __obscura_deliverMessage.
   const to = (targetOrigin === undefined || targetOrigin === null) ? '' : String(targetOrigin);
-  __obscuraCore.ops.op_post_frame_message(
-    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), to, json);
+  if (__obscuraCore.ops.op_post_frame_message(targetFrameId >>> 0, to, json)) return;
+  // Top-level self-posts also work in a standalone runtime without a Page to
+  // drain cross-realm messages. Serialize only once, before scheduling.
+  const origin = _realmOrigin();
+  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
+  const clone = JSON.parse(json).v;
+  setTimeout(() => {
+    try {
+      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+        new MessageEvent('message', { data: clone, origin, source: globalThis })));
+    } catch (error) {
+      console.error('message listener failed:', error && error.message || error);
+    }
+  }, 0);
 }
 
 // The frame's own window and document, when this page is allowed to touch
@@ -13038,6 +14012,44 @@ function _frameObjectsFor(element) {
   return entry || null;
 }
 
+function _ensureInitialFrameRealm(element) {
+  if (element._frameId || !element.isConnected) return;
+  // An opaque sandbox must never receive the creator's security token.
+  if (element.hasAttribute('sandbox') &&
+      !element.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin')) return;
+  const frameId = __obscuraCore.ops.op_initial_frame(_realmFrameId, (child, id) => {
+    const core = child.__obscura_core_handoff;
+    for (const name of Object.keys(__obscuraCore.ops)) core.ops[name] = __obscuraCore.ops[name];
+    delete child.__obscura_core_handoff;
+    delete child.Deno;
+    for (const name of ['__obscura_ua', '__obscura_platform', '__obscura_ua_platform',
+                       '__obscura_ua_platform_version', '__obscura_stealth',
+                       '__obscura_geo_lat', '__obscura_geo_lon']) {
+      if (globalThis[name] !== undefined) child[name] = globalThis[name];
+    }
+    child.__obscura_frameId = id;
+    child.__obscura_parentFrameId = _realmFrameId;
+    child.__obscura_init();
+    Object.defineProperties(child, {
+      parent: { value: globalThis, configurable: true },
+      top: { value: globalThis.top, configurable: true },
+      frameElement: { value: element, configurable: true },
+    });
+    child.innerWidth = 300;
+    child.innerHeight = 150;
+    globalThis.__obscura_frameObjects[id] = {
+      window: child, document: child.document, initial: true,
+    };
+  });
+  if (frameId) {
+    element._frameId = frameId;
+    element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
+    element._iframeDoc = globalThis.__obscura_frameObjects[frameId].document;
+    globalThis.__obscura_frameElements[frameId] = element;
+  }
+  return frameId !== 0;
+}
+
 // The window object this realm uses to stand for frame `frameId`, built once
 // and reused so `event.source === iframe.contentWindow` holds.
 //
@@ -13050,6 +14062,7 @@ function _frameWindowFor(frameId) {
   const real = globalThis.__obscura_frameObjects?.[frameId]?.window;
   const existing = globalThis.__obscura_frameWindows[frameId];
   if (!real) return existing || null;
+  if (globalThis.__obscura_frameObjects[frameId].initial) return real;
   if (existing && existing.__obscura_wrapsRealm) return existing;
 
   const post = _markNative(function (data, targetOrigin, _transfer) {
@@ -13397,11 +14410,12 @@ class _Canvas2D {
     }
   }
   fillRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    const style = this._resolvePaint(this.fillStyle);
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     for (let py = Math.max(0,y); py < Math.min(this._h, y+h); py++) {
       for (let px = Math.max(0,x); px < Math.min(this._w, x+w); px++) {
-        this._setPixel(px, py, r, g, b, a);
+        const c = style.at(px, py);
+        this._setPixel(px, py, c[0], c[1], c[2], c[3]);
       }
     }
     this._markPaintDamage();
@@ -13417,13 +14431,17 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   strokeRect(x, y, w, h) {
-    const [r,g,b,a] = this._parseColor(this.strokeStyle);
+    const style = this._resolvePaint(this.strokeStyle);
+    const put = (px, py) => {
+      const c = style.at(px, py);
+      this._setPixel(px, py, c[0], c[1], c[2], c[3]);
+    };
     const lw = this.lineWidth;
     for (let px = Math.round(x); px < Math.round(x+w); px++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(px, Math.round(y)+l, r,g,b,a); this._setPixel(px, Math.round(y+h)-1-l, r,g,b,a); }
+      for (let l = 0; l < lw; l++) { put(px, Math.round(y)+l); put(px, Math.round(y+h)-1-l); }
     }
     for (let py = Math.round(y); py < Math.round(y+h); py++) {
-      for (let l = 0; l < lw; l++) { this._setPixel(Math.round(x)+l, py, r,g,b,a); this._setPixel(Math.round(x+w)-1-l, py, r,g,b,a); }
+      for (let l = 0; l < lw; l++) { put(Math.round(x)+l, py); put(Math.round(x+w)-1-l, py); }
     }
     this._markPaintDamage();
   }
@@ -13514,7 +14532,7 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   beginPath() { this._path = []; }
-  closePath() {}
+  closePath() { if (this._path && this._path.length) this._path.push({t:'Z'}); }
   moveTo(x, y) { if (this._path) this._path.push({t:'M',x,y}); }
   lineTo(x, y) { if (this._path) this._path.push({t:'L',x,y}); }
   bezierCurveTo() {} quadraticCurveTo() {}
@@ -13523,14 +14541,42 @@ class _Canvas2D {
   rect(x, y, w, h) { this.fillRect(x, y, w, h); }
   fill() {
     if (!this._path) return;
-    const [r,g,b,a] = this._parseColor(this.fillStyle);
+    const style = this._resolvePaint(this.fillStyle);
+    const put = (px, py) => {
+      const c = style.at(px, py);
+      this._setPixel(px, py, c[0], c[1], c[2], c[3]);
+    };
+    // Polygon fill: the old code only handled arcs, so a path built from
+    // moveTo/lineTo (area charts, wedges, any closed shape) filled nothing.
+    // Even-odd scanline over the M/L vertices, arcs still handled below.
+    const poly = this._path.filter((s) => s.t === 'M' || s.t === 'L');
+    if (poly.length >= 3) {
+      let minY = Infinity, maxY = -Infinity;
+      for (const p of poly) { if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; }
+      minY = Math.max(0, Math.round(minY)); maxY = Math.min(this._h - 1, Math.round(maxY));
+      for (let py = minY; py <= maxY; py++) {
+        const xs = [];
+        for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+          const a = poly[i], b = poly[j];
+          if ((a.y > py) !== (b.y > py)) {
+            xs.push(a.x + ((py - a.y) / (b.y - a.y)) * (b.x - a.x));
+          }
+        }
+        xs.sort((m, n) => m - n);
+        for (let k = 0; k + 1 < xs.length; k += 2) {
+          const from = Math.max(0, Math.round(xs[k]));
+          const to = Math.min(this._w - 1, Math.round(xs[k+1]));
+          for (let px = from; px <= to; px++) put(px, py);
+        }
+      }
+    }
     for (const seg of this._path) {
       if (seg.t === 'A') {
         const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
         const r2 = rad * rad;
         for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
           for (let px = Math.max(0, cx - rad); px <= Math.min(this._w - 1, cx + rad); px++) {
-            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) this._setPixel(px, py, r, g, b, a);
+            if ((px-cx)*(px-cx) + (py-cy)*(py-cy) <= r2) put(px, py);
           }
         }
       }
@@ -13538,14 +14584,113 @@ class _Canvas2D {
     this._path = [];
     this._markPaintDamage();
   }
-  stroke() {}
+  // Draw the accumulated path. Was a no-op, so every line chart, sparkline and
+  // axis rendered as blank space while bar charts (fillRect) came out fine --
+  // the shape most dashboards actually use was the one that disappeared.
+  // Bresenham per segment, thickened perpendicular to the run so lineWidth is
+  // honoured; arcs are stroked as a circle outline of the same width.
+  stroke() {
+    if (!this._path || this._path.length === 0) return;
+    const style = this._resolvePaint(this.strokeStyle);
+    const lw = Math.max(1, Math.round(this.lineWidth || 1));
+    const half = (lw - 1) / 2;
+    const dot = (px, py) => {
+      const c = style.at(px, py);
+      this._setPixel(px, py, c[0], c[1], c[2], c[3]);
+    };
+    const thick = (px, py, steep) => {
+      for (let o = -Math.floor(half); o <= Math.ceil(half); o++) {
+        if (steep) dot(px + o, py); else dot(px, py + o);
+      }
+    };
+    const segment = (x0, y0, x1, y1) => {
+      x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+      const dx = Math.abs(x1 - x0), dy = Math.abs(y1 - y0);
+      const steep = dy > dx;
+      const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+      let err = dx - dy;
+      for (;;) {
+        thick(x0, y0, steep);
+        if (x0 === x1 && y0 === y1) break;
+        const e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 < dx) { err += dx; y0 += sy; }
+      }
+    };
+    let cur = null, sub = null;
+    for (const seg of this._path) {
+      if (seg.t === 'M') { cur = seg; sub = seg; }
+      else if (seg.t === 'L') { if (cur) segment(cur.x, cur.y, seg.x, seg.y); cur = seg; }
+      else if (seg.t === 'A') {
+        const steps = Math.max(24, Math.round(seg.r * 8));
+        let prev = null;
+        for (let i = 0; i <= steps; i++) {
+          const a = (i / steps) * Math.PI * 2;
+          const p = { x: seg.x + Math.cos(a) * seg.r, y: seg.y + Math.sin(a) * seg.r };
+          if (prev) segment(prev.x, prev.y, p.x, p.y);
+          prev = p;
+        }
+        cur = seg;
+      } else if (seg.t === 'Z') { if (cur && sub) segment(cur.x, cur.y, sub.x, sub.y); cur = sub; }
+    }
+    this._markPaintDamage();
+  }
   clip() {}
   save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
   restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
-  createLinearGradient(x0,y0,x1,y1) { return { addColorStop(){}, _x0:x0,_y0:y0,_x1:x1,_y1:y1 }; }
-  createRadialGradient() { return { addColorStop(){} }; }
+  // Gradients used to swallow their colour stops (addColorStop was a no-op), so
+  // any fillStyle set to a gradient painted nothing at all. Keep the stops and
+  // let _resolvePaint interpolate them per pixel.
+  createLinearGradient(x0,y0,x1,y1) {
+    const stops = [];
+    return { _kind:'linear', _stops:stops, _x0:x0,_y0:y0,_x1:x1,_y1:y1,
+             addColorStop(o,c){ stops.push({o:+o, c}); } };
+  }
+  createRadialGradient(x0,y0,r0,x1,y1,r1) {
+    const stops = [];
+    return { _kind:'radial', _stops:stops, _x0:x0,_y0:y0,_r0:r0,_x1:x1,_y1:y1,_r1:r1,
+             addColorStop(o,c){ stops.push({o:+o, c}); } };
+  }
+  /** Turn a fillStyle/strokeStyle into { at(x,y) -> [r,g,b,a] }. A plain colour
+   *  resolves once; a gradient interpolates its stops along its axis. */
+  _resolvePaint(style) {
+    if (style && typeof style === 'object' && Array.isArray(style._stops)) {
+      const stops = style._stops.slice().sort((a, b) => a.o - b.o);
+      if (stops.length === 0) return { at: () => [0,0,0,0] };
+      const cols = stops.map((s) => ({ o: s.o, c: this._parseColor(s.c) }));
+      const lerp = (t) => {
+        if (t <= cols[0].o) return cols[0].c;
+        if (t >= cols[cols.length-1].o) return cols[cols.length-1].c;
+        for (let i = 1; i < cols.length; i++) {
+          if (t <= cols[i].o) {
+            const a = cols[i-1], b = cols[i];
+            const span = b.o - a.o;
+            const k = span <= 0 ? 0 : (t - a.o) / span;
+            return [0,1,2,3].map((j) => Math.round(a.c[j] + (b.c[j] - a.c[j]) * k));
+          }
+        }
+        return cols[cols.length-1].c;
+      };
+      if (style._kind === 'radial') {
+        const r1 = style._r1 || 0;
+        return { at: (x, y) => {
+          const d = Math.hypot(x - style._x1, y - style._y1);
+          return lerp(r1 <= 0 ? 1 : Math.min(1, Math.max(0, d / r1)));
+        } };
+      }
+      const dx = style._x1 - style._x0, dy = style._y1 - style._y0;
+      const len2 = dx*dx + dy*dy;
+      return { at: (x, y) => {
+        if (len2 <= 0) return lerp(0);
+        const t = ((x - style._x0) * dx + (y - style._y0) * dy) / len2;
+        return lerp(Math.min(1, Math.max(0, t)));
+      } };
+    }
+    const c = this._parseColor(style);
+    return { at: () => c };
+  }
   createPattern() { return {}; }
   isPointInPath() { return false; }
   isPointInStroke() { return false; }
@@ -13932,13 +15077,8 @@ globalThis.IDBKeyRange = {
   bound(l, u, lo, uo) { return { lower: l, upper: u, lowerOpen: !!lo, upperOpen: !!uo, includes(x) { return (lo ? x > l : x >= l) && (uo ? x < u : x <= u); } }; },
 };
 
-globalThis.caches = {
-  open() { return Promise.resolve({ match(){return Promise.resolve(undefined);}, put(){return Promise.resolve();}, delete(){return Promise.resolve(false);}, keys(){return Promise.resolve([]);} }); },
-  match() { return Promise.resolve(undefined); },
-  has() { return Promise.resolve(false); },
-  delete() { return Promise.resolve(false); },
-  keys() { return Promise.resolve([]); },
-};
+// Do not advertise CacheStorage until it can retain responses. A successful
+// no-op cache selects broken persistence paths instead of normal fetch fallbacks.
 
 _markNative(AudioContext); _markNative(OfflineAudioContext);
 _markNative(SpeechSynthesisUtterance);
@@ -14242,26 +15382,7 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 // Same realm, so this needs no host round trip; it is queued as a task because
 // postMessage never delivers synchronously.
 globalThis.postMessage = function(data, targetOrigin, _transfer) {
-  let clone = data;
-  // Match the cross-realm path: a value postMessage cannot carry is rejected
-  // at the call, not delivered as something else.
-  try {
-    clone = JSON.parse(JSON.stringify({ v: data === undefined ? null : data })).v;
-  } catch (_) {
-    throw new DOMException('The object could not be cloned.', 'DataCloneError');
-  }
-  const origin = _realmOrigin();
-  // A self-post honours targetOrigin too: sender and receiver are this realm,
-  // so a targetOrigin naming a different origin drops the message.
-  if (!_targetOriginAllows(targetOrigin, origin, origin)) return;
-  setTimeout(() => {
-    try {
-      globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
-        new MessageEvent('message', { data: clone, origin, source: globalThis })));
-    } catch (error) {
-      console.error('message listener failed:', error && error.message || error);
-    }
-  }, 0);
+  _sendRealmMessage(_realmFrameId, data, targetOrigin);
 };
 _markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
@@ -14335,7 +15456,9 @@ if (typeof ReadableStream === 'undefined') {
       };
     }
     cancel(reason) {
+      if (this._state === "errored") return Promise.reject(this._error);
       this._queue.length = 0;
+      if (this._state === "closed") return Promise.resolve();
       this._controller.close();
       try { return Promise.resolve(this._source.cancel?.(reason)); }
       catch (error) { return Promise.reject(error); }
@@ -15560,9 +16683,11 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // don't form a proper containment hierarchy (a child's rect can lie far
   // outside its parent's), so a tree walk that only descends into ancestors
   // containing (x,y) would never reach a deep <input> inside <label><p>.
-  // Returns the deepest matching element (highest nid wins as a proxy for
-  // tree depth) so descendants beat ancestors.
+  // querySelectorAll returns tree order, which also makes descendants and
+  // later siblings replace the matching boxes behind them.
   Document.prototype.elementFromPoint = function(x, y) {
+    const method = _documentRealmMember(this, 'elementFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
@@ -15570,7 +16695,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
     if (x < 0 || y < 0 || x > w || y > h) return null;
     if (typeof __obscuraCore.ops.op_layout_hit_test === 'function') {
-      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y);
+      var hitNid = __obscuraCore.ops.op_layout_hit_test(x, y, _realmFrameId);
       if (hitNid >= 0) {
         var hit = _wrapEl(hitNid);
         return hit === this.documentElement && this.body ? this.body : hit;
@@ -15582,7 +16707,6 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     }
     var all = this.querySelectorAll('*');
     var best = null;
-    var bestNid = -1;
     for (var i = 0; i < all.length; i++) {
       var el = all[i];
       if (!el || !el.getBoundingClientRect) continue;
@@ -15629,8 +16753,16 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
           ancestor = ancestor.parentElement;
         }
         if (!visible) continue;
-        var nid = el._nid | 0;
-        if (nid > bestNid) { best = el; bestNid = nid; }
+        if (!best || best.contains(el)) {
+          best = el;
+        } else if (!el.contains(best)) {
+          // Positioned boxes paint above in-flow siblings at the auto layer.
+          // ponytail: z-index stacking needs renderer display-list hit testing
+          // when overlapping positioned layers become a measured blocker.
+          var elPositioned = getComputedStyle(el).position !== 'static';
+          var bestPositioned = getComputedStyle(best).position !== 'static';
+          if (elPositioned || !bestPositioned) best = el;
+        }
       }
     }
     return best || this.body || this.documentElement || null;
@@ -15649,9 +16781,22 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+// Capture late-defined members too, before page code can replace them.
+const _nativeElementClick = Element.prototype.click;
+const _documentMembers = Object.freeze(Object.fromEntries([
+  ...['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+    const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
+    return [name, descriptor.value || descriptor.get];
+  }),
+  ['activateElement', function(trusted) {
+    return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
+  }],
+]));
+
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
+  __obscuraCore.ops.op_register_document_realm(_documentMembers, _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
@@ -15699,11 +16844,18 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  // A navigation start precedes the wall clock, so skew into the past only: an
-  // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
-  globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  const timing = {};
+  for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
+    Object.defineProperty(timing, name, {
+      enumerable: true, get() { return +_dom('performance_timing', name); },
+    });
+  }
+  Object.defineProperty(globalThis.performance, 'timeOrigin', {
+    configurable: true, value: +_dom('performance_time_origin'), writable: false,
+  });
+  Object.defineProperty(globalThis.performance, 'timing', {
+    configurable: true, value: timing, writable: false,
+  });
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,

@@ -424,7 +424,9 @@ pub(crate) fn apply_animation_declarations(style: &mut LayoutStyle, css: &str) {
             continue;
         };
         let name = name.trim().to_ascii_lowercase();
-        if name == "animation" || name.starts_with("animation-") {
+        // display:none determines whether a CSS animation can exist, even
+        // when an important declaration overrides the normal display value.
+        if name == "display" || name == "animation" || name.starts_with("animation-") {
             apply_value(style, &name, value.trim());
         }
     }
@@ -503,6 +505,73 @@ pub(crate) fn split_declarations(css: &str) -> Vec<&str> {
     }
     parts.push(&css[start..]);
     parts
+}
+
+/// Whether an inline-style edit can leave CSSOM View's untransformed box
+/// metrics intact. This is deliberately narrower than "paint only": callers
+/// use it only for `client*`/`offset*`, while transformed visual rectangles
+/// still force an exact render. Comparing every other declaration in source
+/// order keeps shorthands, custom properties, priorities, and duplicate
+/// declarations conservative without maintaining a second CSS cascade.
+pub fn inline_style_change_preserves_box_metrics(old: Option<&str>, new: Option<&str>) -> bool {
+    fn next_layout_declaration<'a>(
+        declarations: &mut impl Iterator<Item = &'a str>,
+    ) -> Option<(&'a str, &'a str)> {
+        loop {
+            let raw = declarations.next()?;
+            let Some((name, value)) = raw.trim().split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("transform")
+                || name.eq_ignore_ascii_case("-webkit-transform")
+            {
+                continue;
+            }
+            return Some((name, value.trim()));
+        }
+    }
+
+    let mut old = old.into_iter().flat_map(split_declarations);
+    let mut new = new.into_iter().flat_map(split_declarations);
+    loop {
+        match (
+            next_layout_declaration(&mut old),
+            next_layout_declaration(&mut new),
+        ) {
+            (Some((old_name, old_value)), Some((new_name, new_value)))
+                if old_name.eq_ignore_ascii_case(new_name) && old_value == new_value => {}
+            (None, None) => return true,
+            _ => return false,
+        }
+    }
+}
+
+fn parse_containment(value: &str) -> Option<u8> {
+    use crate::{CONTAIN_SIZE, CONTAIN_INLINE_SIZE, CONTAIN_LAYOUT, CONTAIN_STYLE, CONTAIN_PAINT};
+    let value = value.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "none" | "initial" | "unset" | "revert" | "revert-layer" => return Some(0),
+        "inherit" => return Some(crate::CONTAIN_INHERIT),
+        "strict" => return Some(CONTAIN_SIZE | CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        "content" => return Some(CONTAIN_LAYOUT | CONTAIN_STYLE | CONTAIN_PAINT),
+        _ => {}
+    }
+    let mut flags = 0;
+    for token in value.split_ascii_whitespace() {
+        let flag = match token {
+            "size" => CONTAIN_SIZE,
+            "inline-size" => CONTAIN_INLINE_SIZE,
+            "layout" => CONTAIN_LAYOUT,
+            "style" => CONTAIN_STYLE,
+            "paint" => CONTAIN_PAINT,
+            _ => return None,
+        };
+        if flags & flag != 0 { return None; }
+        flags |= flag;
+    }
+    (flags != 0 && flags & (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)
+        != (CONTAIN_SIZE | CONTAIN_INLINE_SIZE)).then_some(flags)
 }
 
 fn parse_container_type(value: &str) -> Option<crate::ContainerType> {
@@ -1862,13 +1931,11 @@ fn apply_value(style: &mut LayoutStyle, name: &str, value: &str) {
             non_none_value(value),
         ),
         "contain" => {
-            let establishes = value.split_whitespace().any(|v| {
-                matches!(
-                    v.to_ascii_lowercase().as_str(),
-                    "layout" | "paint" | "strict" | "content"
-                )
-            });
-            set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN, establishes);
+            if let Some(flags) = parse_containment(value) {
+                style.containment = flags;
+                set_containing_block_trigger(style, crate::CB_TRIGGER_CONTAIN,
+                    flags & (crate::CONTAIN_LAYOUT | crate::CONTAIN_PAINT) != 0);
+            }
         }
         "will-change" => {
             let establishes = value.split([',', ' ']).map(str::trim).any(|v| {
