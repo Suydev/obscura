@@ -4915,6 +4915,10 @@ class Element extends Node {
   }
   get offsetParent() {
     if (!this.isConnected || this._renderBoxGeometry() === null) return null;
+    // CSSOM View: null for the root element and the body element. Returning
+    // document.body here made body.offsetParent === body, so the common
+    // `while (el) { x += el.offsetLeft; el = el.offsetParent; }` never ended.
+    if (this === document.documentElement || this === document.body) return null;
     const ownStyle = globalThis.getComputedStyle(this);
     if (ownStyle.position === 'fixed') return null;
 
