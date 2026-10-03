@@ -23121,6 +23121,104 @@ mod tests {
         );
     }
 
+    #[test]
+    fn document_write_foster_parenting_preserves_order_and_mutation_records() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            var scriptTestSetup = true;
+            document.open();
+            document.write('<table id="table"><tr><td>cell');
+            const table = document.getElementById('table');
+            const label = node => node.nodeType === 3 ? node.data : node.nodeName;
+            const observer = new MutationObserver(() => {});
+            observer.observe(document.body, {childList: true});
+            document.write('</td></tr>outside<b>bold</b>tail</table><p>end</p>');
+            const added = observer.takeRecords().flatMap(record => Array.from(record.addedNodes, label));
+            observer.disconnect();
+            const order = Array.from(document.body.childNodes, label);
+            document.close();
+            return {order, added, sameTable: document.getElementById('table') === table};
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "order": ["outside", "B", "tail", "TABLE", "P"],
+            "added": ["outside", "B", "tail", "P"],
+            "sameTable": true,
+        }));
+    }
+
+    #[test]
+    fn document_write_foster_parenting_grows_the_existing_text_node() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            var scriptTestSetup = true;
+            document.open();
+            document.write('<table id="table"><tr><td>cell');
+            const table = document.getElementById('table');
+            document.write('</td></tr>outside<!--flush-->');
+            const text = document.body.firstChild;
+            const first = text.nodeType === 3 ? text.data : null;
+            document.write('more</table>');
+            const second = document.body.firstChild.nodeType === 3 ? document.body.firstChild.data : null;
+            const sameText = document.body.firstChild === text;
+            document.close();
+            return {first, second, sameText, sameTable: document.getElementById('table') === table};
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "first": "outside", "second": "outsidemore", "sameText": true, "sameTable": true,
+        }));
+    }
+
+    #[test]
+    fn document_write_foster_parenting_uses_the_live_anchor_parent() {
+        for moved in [false, true] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.evaluate(&format!("globalThis.moveWrittenTable = {moved}")).unwrap();
+            let result = rt.evaluate(r#"
+                var scriptTestSetup = true;
+                document.open();
+                document.write('<table id="table"><tr><td>cell');
+                const table = document.getElementById('table');
+                let parent = document.body;
+                if (moveWrittenTable) {
+                    parent = document.createElement('div');
+                    document.body.appendChild(parent);
+                    parent.appendChild(table);
+                } else {
+                    table.remove();
+                }
+                const observer = new MutationObserver(() => {});
+                observer.observe(parent, {childList: true});
+                let error = null;
+                try { document.write('</td></tr>outside</table>'); }
+                catch (caught) { error = caught.name; }
+                const label = node => node.nodeType === 3 ? node.data : node.nodeName;
+                const added = observer.takeRecords().flatMap(record => Array.from(record.addedNodes, label));
+                observer.disconnect();
+                const order = Array.from(parent.childNodes, label);
+                document.close();
+                return {order, added, error, sameTable: moveWrittenTable ? parent.lastChild === table : table.parentNode === null};
+            "#).unwrap();
+            let order = if moved { vec!["outside", "TABLE"] } else { vec!["outside"] };
+            assert_eq!(result, serde_json::json!({
+                "order": order, "added": ["outside"], "error": null, "sameTable": true,
+            }));
+        }
+    }
+
+    #[test]
+    fn document_write_foster_parenting_keeps_the_inline_insertion_point() {
+        let mut rt = setup_runtime("<html><body><script id=writer></script></body></html>");
+        let result = rt.evaluate(r#"
+            var scriptTestSetup = true;
+            globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+            document.write('<table id="table"><tr><td>cell');
+            document.write('</td></tr>outside</table><p>end</p>');
+            globalThis.__currentScriptNid = 0;
+            return Array.from(document.body.childNodes, node => node.nodeType === 3 ? node.data : node.nodeName);
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(["SCRIPT", "outside", "TABLE", "P"]));
+    }
+
     // WebIDL puts interface operations on the interface prototype with
     // enumerable: true, so in a browser Object.keys(MutationObserver.prototype)
     // is ['observe', 'disconnect', 'takeRecords']. ES class methods are

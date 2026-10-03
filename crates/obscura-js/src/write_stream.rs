@@ -38,6 +38,7 @@ impl Tracer for RetainedNodes {
 pub(crate) struct Placement {
     pub(crate) parent: Option<NodeId>,
     pub(crate) node: NodeId,
+    pub(crate) before: Option<NodeId>,
 }
 
 /// A `<script>` runs as soon as it is inserted, so a half-written one must not.
@@ -106,27 +107,43 @@ impl DocumentWriteStream {
         // Only look at what is new. A walk over all children would cost as much per call as
         // the input stream written so far is long, so quadratic over a thousand calls. Measured at
         // 5000 calls: 852 ms versus 4130 ms.
-        let mut stack: Vec<NodeId> = fresh_children(source, root, handed_over);
+        let mut stack: Vec<(NodeId, Option<NodeId>)> = fresh_children(source, root, handed_over)
+            .into_iter().map(|id| (id, None)).collect();
 
-        while let Some(current) = stack.pop() {
+        while let Some((current, before)) = stack.pop() {
             let node = match source.get_node(current) {
                 Some(node) => node,
                 None => continue,
             };
 
             if let Some(&copy) = handed_over.get(&current) {
+                // Foster parenting inserts before an existing sibling. Carry that sibling
+                // as a stable anchor, and stop at the first already-copied predecessor.
+                let mut previous = node.prev_sibling;
+                while let Some(id) = previous {
+                    let Some(sibling) = source.get_node(id) else { break; };
+                    if handed_over.contains_key(&id) {
+                        if sibling.is_text() { stack.push((id, None)); }
+                        break;
+                    }
+                    stack.push((id, Some(copy)));
+                    previous = sibling.prev_sibling;
+                }
                 // A text node at the end of the input stream grows with every call and stays the
-                // same node. Elements no longer change after their creation.
+                // same node, including immediately before a foster-parenting anchor.
                 if node.is_text() {
                     let text = source.text_content(current);
-                    dom.with_node_mut(copy, |n| {
-                        if let NodeData::Text { contents } = &mut n.data {
-                            *contents = text;
-                        }
-                    });
+                    if dom.with_node(copy, |n| matches!(&n.data,
+                        NodeData::Text { contents } if contents == &text)) != Some(true) {
+                        dom.with_node_mut(copy, |n| {
+                            if let NodeData::Text { contents } = &mut n.data {
+                                *contents = text;
+                            }
+                        });
+                    }
                 }
                 for child in fresh_children(source, current, handed_over) {
-                    stack.push(child);
+                    stack.push((child, None));
                 }
                 continue;
             }
@@ -151,7 +168,7 @@ impl DocumentWriteStream {
                 };
                 dom.detach(copy);
                 map_subtree(source, current, dom, copy, handed_over);
-                placements.push(Placement { parent, node: copy });
+                placements.push(Placement { parent, node: copy, before });
                 continue;
             }
 
@@ -159,9 +176,9 @@ impl DocumentWriteStream {
             // never closed appear at once instead of never.
             let copy = dom.new_node(node.data.clone());
             handed_over.insert(current, copy);
-            placements.push(Placement { parent, node: copy });
+            placements.push(Placement { parent, node: copy, before });
             for child in fresh_children(source, current, handed_over) {
-                stack.push(child);
+                stack.push((child, None));
             }
         }
 
@@ -172,9 +189,9 @@ impl DocumentWriteStream {
 /// The children of `parent` still to do, as a stack: the top element is processed first.
 ///
 /// The walk goes backward from the last child and stops at the first one already handed over.
-/// The parser only appends at the back, so everything before it is done. This one already
-/// handed-over child comes back along, because a text node at the end of the input stream keeps
-/// growing and an open element still receives children.
+/// This already handed-over child comes back along, because a text node keeps growing, an
+/// open element receives children, and foster parenting can add preceding siblings. The mirror
+/// discovers those siblings at this boundary rather than rescanning all earlier children.
 fn fresh_children(
     source: &DomTree,
     parent: NodeId,

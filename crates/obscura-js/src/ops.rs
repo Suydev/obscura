@@ -2472,7 +2472,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.write() feeds the document's input stream, so the calls
         // share one parser and one tokenizer state. Returns the nodes that
         // became complete with this call, for the caller to run scripts among.
-        // Returns [[parent, node], …], parents before children. A `parent` of -1 means the node
+        // Returns [[parent, node, before], …], parents before children. A `parent` of -1 means the node
         // belongs at the insertion point, which the caller knows. Nothing is inserted here:
         // that must go through Node.appendChild on the JS side, because that call also reports
         // the mutation, registers window named access, and loads a written stylesheet.
@@ -2495,12 +2495,13 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             {
                 gs.document_write_inserted_script.set(true);
             }
-            let pairs: Vec<[i32; 2]> = placements
+            let pairs: Vec<[i32; 3]> = placements
                 .iter()
                 .map(|placement| {
                     [
                         placement.parent.map_or(-1, |id| id.index() as i32),
                         placement.node.index() as i32,
+                        placement.before.map_or(-1, |id| id.index() as i32),
                     ]
                 })
                 .collect();

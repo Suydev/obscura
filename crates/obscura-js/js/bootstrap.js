@@ -6387,7 +6387,13 @@ function _insertWrittenNodes(doc, placements) {
     if (!node) continue;
     if (node.nodeType === 10) doc._doctype = undefined;
     if (node.nodeType === 1 && node.tagName === 'SCRIPT') __documentWriteScripts.add(node);
-    if (parentNid >= 0) {
+    var beforeNid = +placements[i][2];
+    var before = beforeNid >= 0 ? _wrap(beforeNid) : null;
+    // A script can move or remove the parser's insertion anchor between writes.
+    // Use its live parent when present, or append at the normal insertion point.
+    if (before && before.parentNode) {
+      before.parentNode.insertBefore(node, before);
+    } else if (parentNid >= 0) {
       var parent = _wrap(parentNid);
       if (parent) parent.appendChild(node);
     } else if (after) {
