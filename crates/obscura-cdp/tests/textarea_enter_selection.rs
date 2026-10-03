@@ -108,3 +108,38 @@ async fn typing_continues_after_the_inserted_newline() {
     assert_eq!(result["start"], 3);
     assert_eq!(result["end"], 3);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn readonly_fields_reject_deletion_and_newlines_but_keep_keyboard_events() {
+    let mut ctx = setup().await;
+    for tag in ["input", "textarea"] {
+        evaluate(&mut ctx, &format!(
+            "document.body.innerHTML = '<{tag} id=field></{tag}>'; field.focus();\
+             for (const type of ['keydown', 'keypress', 'beforeinput', 'input', 'keyup'])\
+             field.addEventListener(type, event => changes.push(event.type));"
+        )).await;
+        for (key, text, virtual_key) in [("Backspace", "", 8), ("Delete", "", 46), ("Enter", "\r", 13)] {
+            if tag == "input" && key == "Enter" { continue; }
+            for readonly in [true, false] {
+                evaluate(&mut ctx, &format!(
+                    "field.toggleAttribute('readonly', {readonly}); field.value = 'abCD';\
+                     field.setSelectionRange(1, 3); changes.length = 0;"
+                )).await;
+                cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
+                    "type": "keyDown", "key": key, "text": text,
+                    "windowsVirtualKeyCode": virtual_key,
+                })).await;
+                cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
+                    "type": "keyUp", "key": key, "windowsVirtualKeyCode": virtual_key,
+                })).await;
+                let expected = match (readonly, key) {
+                    (true, "Enter") => json!({"value":"abCD", "start":1, "end":3, "changes":["keydown","keypress","keyup"]}),
+                    (true, _) => json!({"value":"abCD", "start":1, "end":3, "changes":["keydown","keyup"]}),
+                    (false, "Enter") => json!({"value":"a\nD", "start":2, "end":2, "changes":["keydown","keypress","input","keyup"]}),
+                    (false, _) => json!({"value":"aD", "start":1, "end":1, "changes":["keydown","input","keyup"]}),
+                };
+                assert_eq!(state(&mut ctx).await, expected, "{tag} {key} readonly={readonly}");
+            }
+        }
+    }
+}

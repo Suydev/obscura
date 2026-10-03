@@ -53,6 +53,7 @@ fn insert_text_js(text: &str) -> String {
 const BACKSPACE_JS: &str = "(function() {\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.hasAttribute('readonly')) return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
     function backCount(str, p) {\
@@ -84,6 +85,7 @@ const BACKSPACE_JS: &str = "(function() {\
 const DELETE_JS: &str = "(function() {\
     var t = document.activeElement;\
     if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+    if (t.hasAttribute('readonly')) return;\
     var v = t.value || '';\
     var s = t.selectionStart, e = t.selectionEnd;\
     if (s == null) return;\
@@ -446,6 +448,7 @@ pub async fn handle(
                                 if (!target) return;\
                                 target.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keypress', {bubbles:true,key:'Enter',code:'Enter',keyCode:$VK,which:$VK,charCode:$VK,$MODIFIERS})));\
                                 if (target.localName === 'textarea') {\
+                                    if (target.hasAttribute('readonly')) return;\
                                     var value = target.value || '';\
                                     var start = target.selectionStart, end = target.selectionEnd;\
                                     start = start == null ? value.length : Math.max(0, Math.min(start, value.length));\
