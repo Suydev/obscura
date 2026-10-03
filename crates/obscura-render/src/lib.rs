@@ -975,6 +975,9 @@ pub struct LayoutStyle {
     /// until the parent's computed outer/inner display is known. The DOM
     /// top-down pass copies that provenance and then clears this marker.
     pub(crate) display_inherit: bool,
+    /// Inline outer display before absolute-position blockification. Retained
+    /// styles need this provenance to reconstruct the hypothetical static box.
+    pub(crate) static_position_inline: bool,
     /// Original legacy flexbox display provenance. `Some(false)` is
     /// `-webkit-box`; `Some(true)` is `-webkit-inline-box`. A vertical legacy
     /// box with an active line clamp computes to flow-root/inline-block, but
@@ -1696,6 +1699,9 @@ pub(crate) fn is_inline_level_box(style: &LayoutStyle) -> bool {
 pub(crate) fn blockify_outer_display(style: &mut LayoutStyle) {
     if !is_inline_level_box(style) {
         return;
+    }
+    if matches!(style.position, Some(taffy::Position::Absolute)) {
+        style.static_position_inline = true;
     }
     if style.display == Display::Inline {
         style.display = Display::Block;

@@ -12028,6 +12028,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn absolute_inline_control_preserves_static_position_and_hit_target() {
+        for (name, display, children, input_rules, x, y) in [
+            ("before inline", "block", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+            ("after inline", "block", "<label for='control'></label><input id='control' type='checkbox'>", "", 32.0, 0.0),
+            ("between inlines", "block", "<label for='control'></label><input id='control' type='checkbox'><label for='control'></label>", "", 32.0, 0.0),
+            ("after block", "block", "<div style='height:16px'></div><input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 16.0),
+            ("explicit insets", "block", "<input id='control' type='checkbox'><label for='control'></label>", "top:0;left:0", 0.0, 0.0),
+            ("authored block", "block", "<input id='control' type='checkbox'><label for='control'></label>", "display:block", 0.0, 0.0),
+            ("flex control", "flex", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+            ("grid control", "grid", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                html,body {{margin:0}}
+                #switch {{position:relative;width:80px;height:48px;display:{display};line-height:1}}
+                input {{position:absolute;width:32px;height:16px;opacity:0;z-index:-1000;margin:0;{input_rules}}}
+                label {{display:inline-block;box-sizing:border-box;width:32px;height:16px;border:1px solid}}
+                </style><div id="switch">{children}</div>"#));
+            let mut cache = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let label = tree.query_selector("label").unwrap().unwrap();
+            let input = tree.get_element_by_id("control").unwrap();
+            assert_eq!(prepared.layout.rects[&label].height, 16.0);
+            assert_eq!(prepared.layout.rects[&input].height, 16.0);
+            assert_eq!(prepared.layout.rects[&input].x, x, "{name}");
+            assert_eq!(prepared.layout.rects[&input].y, y, "{name}");
+            let rect = prepared.layout.rects[&label];
+            assert_eq!(prepared.hit_test(&tree, &scroll, rect.x + 16.0, rect.y + 8.0), Some(label), "{name}");
+        }
+    }
+
     // #1019: a near-singular transform over content far larger than the viewport
     // makes one element's transform layer unallocatable. It must skip that
     // element, not abort the whole page paint.
