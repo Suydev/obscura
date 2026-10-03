@@ -7723,6 +7723,45 @@ mod tests {
     }
 
     #[test]
+    fn editing_command_detection_reports_unsupported_commands_without_mutation() {
+        let mut rt = setup_runtime("<body><p>unchanged</p><iframe></iframe></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const docs = [document, document.implementation.createHTMLDocument('detached'),
+                new DOMParser().parseFromString('<p>parsed</p>', 'text/html')];
+            const commands = ['copy', 'cut', 'paste', 'bold', 'obscura-unknown-command'];
+            const support = docs.map(doc => commands.map(command => doc.queryCommandSupported(command)));
+            const child = document.querySelector('iframe').contentDocument;
+            const borrowed = Document.prototype.queryCommandSupported;
+            Object.setPrototypeOf(child, Document.prototype);
+            Object.defineProperty(child, 'nodeType', { get() { throw new Error('author getter'); } });
+            return [support, borrowed.call(child, 'copy'), document.execCommand('copy'),
+                document.querySelector('p').textContent];
+        })()"#).unwrap(), serde_json::json!([
+            [[false, false, false, false, false], [false, false, false, false, false],
+                [false, false, false, false, false]], false, false, "unchanged"
+        ]));
+    }
+
+    #[test]
+    fn editing_command_detection_checks_receiver_and_converts_domstring() {
+        let mut rt = setup_runtime("<body></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const hints = [];
+            const command = { [Symbol.toPrimitive](hint) { hints.push(hint); return 'unknown'; } };
+            const supported = document.queryCommandSupported(command);
+            const errorName = action => { try { action(); return null; } catch (e) { return e.name; } };
+            const errors = [errorName(() => document.queryCommandSupported()),
+                errorName(() => document.queryCommandSupported(Symbol('command'))),
+                errorName(() => Document.prototype.queryCommandSupported.call({}, command)),
+                errorName(() => Document.prototype.queryCommandSupported.call(Object.create(Document.prototype), command)),
+                errorName(() => document.queryCommandSupported({ toString() { throw new RangeError(); } }))];
+            return [supported, hints, errors];
+        })()"#).unwrap(), serde_json::json!([
+            false, ["string"], ["TypeError", "TypeError", "TypeError", "TypeError", "RangeError"]
+        ]));
+    }
+
+    #[test]
     fn test_document_title() {
         let mut rt = setup_runtime("<html><head><title>Test</title></head><body></body></html>");
         let title = rt.evaluate("document.title").unwrap();

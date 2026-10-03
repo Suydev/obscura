@@ -5687,7 +5687,12 @@ function _throwDocumentDomainSecurityError() {
   throw new DOMException("Failed to set the 'domain' property on 'Document'", "SecurityError");
 }
 
+const _documentInstances = new WeakSet();
 class Document extends Node {
+  constructor(nid) {
+    super(nid);
+    _documentInstances.add(this);
+  }
   get timeline() {
     if (!this._timeline) {
       this._timeline = new DocumentTimeline();
@@ -6369,6 +6374,16 @@ class Document extends Node {
     setTimeout(finishParsing, 0);
   }
   hasFocus() { return true; }
+  queryCommandSupported(commandId) {
+    const method = _documentRealmMember(this, 'queryCommandSupported');
+    if (method) return Reflect.apply(method, this, arguments);
+    if (!_documentInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) throw new TypeError('queryCommandSupported requires 1 argument');
+    commandId = `${commandId}`;
+    // execCommand currently implements no editing commands. Feature detection
+    // must not advertise clipboard or formatting actions that do nothing.
+    return false;
+  }
   execCommand() { return false; }
 }
 
@@ -11270,6 +11285,7 @@ globalThis.DOMParser = class DOMParser {
       _root: root,
       nodeName: "#document",
       nodeType: 9,
+      queryCommandSupported: Document.prototype.queryCommandSupported,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
       get documentElement() {
         // For XML parsererror docs, return the <parsererror> child, not the
@@ -11371,6 +11387,7 @@ globalThis.DOMParser = class DOMParser {
       contains(n) { return root.contains ? root.contains(n) : false; },
       addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
     };
+    _documentInstances.add(docNode);
     return docNode;
   }
 };
@@ -16754,7 +16771,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 
 // Capture late-defined document members too, before page code can replace them.
 const _documentMembers = Object.freeze(Object.fromEntries(
-  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint', 'queryCommandSupported'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   })));
