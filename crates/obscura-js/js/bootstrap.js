@@ -149,12 +149,12 @@ const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
-  "set_fragment_html_executable", "document_write",
+  "set_fragment_html_executable", "document_write", "document_write_close",
 ]);
 const _DOM_TREE_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
-  "document_write",
+  "document_write", "document_write_close",
 ]);
 // Which realm this bootstrap closure belongs to. Every wrapper's methods come
 // from its own realm's prototypes, so a DOM call names the document it belongs
@@ -5801,7 +5801,11 @@ class Document extends Node {
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
-  get compatMode() { return "CSS1Compat"; }
+  get compatMode() {
+    const get = _documentRealmMember(this, 'compatMode');
+    return get ? Reflect.apply(get, this, [])
+      : (this._nid == null ? "CSS1Compat" : _dom("document_compat_mode"));
+  }
   // The document's character encoding, detected from the response charset
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
@@ -6298,50 +6302,14 @@ class Document extends Node {
   // one per attribute, then ">".
   // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
   write(...args) {
+    const method = _documentRealmMember(this, 'write');
+    if (method) return Reflect.apply(method, this, args);
     var html = args.join('');
     if (!html) return;
-    var body = this.body;
-    if (!body) return;
     // The host parses into the input stream and returns [[parent, node], …], parents first. The
     // insertion stays here, because appendChild does more than append: it reports the
     // mutation, registers window named access, and loads a written stylesheet.
-    var placements = _domParse("document_write", "", html) || [];
-    // The insertion point is the position of the running script. What it writes belongs
-    // behind it, not at the end of the body. The point moves along with every node placed,
-    // even across calls, so that a script's second call lands behind the first instead of
-    // directly behind the script again.
-    var scriptNid = globalThis.__currentScriptNid || 0;
-    var after = null;
-    if (scriptNid) {
-      var anchorNid = this._writeAnchorScript === scriptNid && this._writeAnchorNid
-        ? this._writeAnchorNid
-        : scriptNid;
-      var anchor = _wrap(anchorNid);
-      if (anchor && anchor.parentNode) after = anchor;
-    }
-    for (var i = 0; i < placements.length; i++) {
-      var parentNid = +placements[i][0];
-      var node = _wrap(+placements[i][1]);
-      if (!node) continue;
-      if (node.nodeType === 1 && node.tagName === 'SCRIPT') {
-        __documentWriteScripts.add(node);
-      }
-      if (parentNid) {
-        var parent = _wrap(parentNid);
-        if (parent) parent.appendChild(node);
-        continue;
-      }
-      if (after) {
-        after.parentNode.insertBefore(node, after.nextSibling);
-        after = node;
-      } else {
-        body.appendChild(node);
-      }
-    }
-    if (scriptNid && after) {
-      this._writeAnchorScript = scriptNid;
-      this._writeAnchorNid = after._nid;
-    }
+    _insertWrittenNodes(this, _domParse("document_write", "", html) || []);
   }
   writeln(...args) {
     this.write(args.join('') + '\n');
@@ -6350,10 +6318,10 @@ class Document extends Node {
     const method = _documentRealmMember(this, 'open');
     if (method) return Reflect.apply(method, this, []);
     // Native algorithms use the receiver's tree, not script-overridden getters.
-    const head = _wrapEl(+_dom('query_selector', 'head'));
-    if (head) head.innerHTML = '';
-    const body = _wrapEl(+_dom('query_selector', 'body'));
-    if (body) body.innerHTML = '';
+    for (const nid of _domParse('child_nodes', this._nid) || []) {
+      Node.prototype.removeChild.call(this, _wrap(nid));
+    }
+    this._doctype = undefined;
     // A new parse begins. Whatever the input stream still held is gone.
     _dom("document_write_reset");
     this._writeAnchorScript = 0;
@@ -6369,6 +6337,7 @@ class Document extends Node {
     if (method) return Reflect.apply(method, this, []);
     if (!this._writeOpen) return;
     this._writeOpen = false;
+    _insertWrittenNodes(this, _domParse('document_write_close') || []);
     const generation = this._writeGeneration;
     const finishParsing = () => {
       if (generation !== this._writeGeneration) return;
@@ -6399,6 +6368,40 @@ class Document extends Node {
   }
   hasFocus() { return true; }
   execCommand() { return false; }
+}
+
+// Shared by write and the final EOF flush. A nonnegative parent is a real node,
+// including document node 0; -1 denotes the running script's insertion point.
+function _insertWrittenNodes(doc, placements) {
+  var scriptNid = globalThis.__currentScriptNid || 0;
+  var after = null;
+  if (scriptNid) {
+    var anchorNid = doc._writeAnchorScript === scriptNid && doc._writeAnchorNid
+      ? doc._writeAnchorNid : scriptNid;
+    var anchor = _wrap(anchorNid);
+    if (anchor && anchor.parentNode) after = anchor;
+  }
+  for (var i = 0; i < placements.length; i++) {
+    var parentNid = +placements[i][0];
+    var node = _wrap(+placements[i][1]);
+    if (!node) continue;
+    if (node.nodeType === 10) doc._doctype = undefined;
+    if (node.nodeType === 1 && node.tagName === 'SCRIPT') __documentWriteScripts.add(node);
+    if (parentNid >= 0) {
+      var parent = _wrap(parentNid);
+      if (parent) parent.appendChild(node);
+    } else if (after) {
+      after.parentNode.insertBefore(node, after.nextSibling);
+      after = node;
+    } else {
+      var body = _wrapEl(+_dom('query_selector', 'body'));
+      if (body) body.appendChild(node);
+    }
+  }
+  if (scriptNid && after) {
+    doc._writeAnchorScript = scriptNid;
+    doc._writeAnchorNid = after._nid;
+  }
 }
 
 // Preserve the receiver realm's implementations even if a membrane remaps the
@@ -16797,7 +16800,7 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
 // Capture late-defined members too, before page code can replace them.
 const _nativeElementClick = Element.prototype.click;
 const _documentMembers = Object.freeze(Object.fromEntries([
-  ...['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
   }),

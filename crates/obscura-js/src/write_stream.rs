@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
-use html5ever::driver::{parse_fragment, ParseOpts, Parser};
+use html5ever::driver::{parse_document, parse_fragment, ParseOpts, Parser};
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::Tracer;
 use html5ever::{local_name, ns, QualName};
@@ -52,6 +52,7 @@ fn needs_to_be_complete(source: &DomTree, node: NodeId) -> bool {
 
 pub(crate) struct DocumentWriteStream {
     parser: Parser<DomTree>,
+    document: bool,
     /// Maps a node of the parser tree to its copy in the document. A node missing here has
     /// not been handed over yet.
     handed_over: HashMap<NodeId, NodeId>,
@@ -60,11 +61,16 @@ pub(crate) struct DocumentWriteStream {
 }
 
 impl DocumentWriteStream {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(document: bool) -> Self {
         // Scripting enabled, as with the fragment parser behind innerHTML.
         let context = QualName::new(None, ns!(html), local_name!("body"));
         DocumentWriteStream {
-            parser: parse_fragment(DomTree::new(), ParseOpts::default(), context, vec![], true),
+            parser: if document {
+                parse_document(DomTree::new(), ParseOpts::default())
+            } else {
+                parse_fragment(DomTree::new(), ParseOpts::default(), context, vec![], true)
+            },
+            document,
             handed_over: HashMap::new(),
             staging: None,
         }
@@ -74,17 +80,28 @@ impl DocumentWriteStream {
     /// Returns the nodes to insert, parents before children.
     pub(crate) fn write(&mut self, html: &str, dom: &DomTree) -> Vec<Placement> {
         self.parser.process(html.into());
+        self.mirror(dom)
+    }
 
+    pub(crate) fn close(&mut self, dom: &DomTree) -> Vec<Placement> {
+        self.parser.tokenizer.end();
+        self.mirror(dom)
+    }
+
+    fn mirror(&mut self, dom: &DomTree) -> Vec<Placement> {
         let retained = RetainedNodes::default();
         self.parser.tokenizer.sink.trace_handles(&retained);
         let retained = retained.0.into_inner();
 
         // Separate fields: the parser tree is read, the mapping is written.
         let source = &self.parser.tokenizer.sink.sink;
+        if self.document {
+            dom.set_quirks(source.is_quirks());
+        }
         let handed_over = &mut self.handed_over;
         let staging = &mut self.staging;
 
-        let root = source.fragment_root();
+        let root = if self.document { source.document() } else { source.fragment_root() };
         let mut placements = Vec::new();
         // Only look at what is new. A walk over all children would cost as much per call as
         // the input stream written so far is long, so quadratic over a thousand calls. Measured at
@@ -115,7 +132,7 @@ impl DocumentWriteStream {
             }
 
             let parent = match node.parent {
-                Some(p) if p == root => None,
+                Some(p) if p == root => self.document.then(|| dom.document()),
                 // If the parent is held back, this one waits along.
                 Some(p) => match handed_over.get(&p) {
                     Some(&copy) => Some(copy),

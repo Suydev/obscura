@@ -3745,7 +3745,7 @@ impl Page {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
-            "<!DOCTYPE html><html><head></head><body></body></html>",
+            "<html><head></head><body></body></html>",
         ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
@@ -4995,6 +4995,19 @@ mod tests {
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_navigation_has_no_doctype_and_starts_in_quirks_mode() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("blank-mode".into()));
+        let mut page = super::Page::new("blank-mode".into(), context);
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.evaluate(r#"(() => [
+            document.compatMode, document.doctype,
+            Array.from(document.childNodes, node => node.nodeType),
+            document.documentElement.nodeName, document.head.nodeName, document.body.nodeName
+        ])()"#), serde_json::json!(["BackCompat", null, [1], "HTML", "HEAD", "BODY"]));
+        assert!(page.with_dom(|dom| dom.is_quirks()).unwrap());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn network_idle_quiet_deadline_does_not_gain_an_extra_polling_slice() {
