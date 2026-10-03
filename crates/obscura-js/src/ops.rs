@@ -89,6 +89,7 @@ pub struct JsNetworkEvent {
     pub intercepted: bool,
     pub url: String,
     pub method: String,
+    pub resource_type: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
@@ -3245,8 +3246,17 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
-    internal_load: bool,
+    #[string] destination: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let (resource_type, resource_type_name) = match destination.as_str() {
+        "Script" => (ResourceType::Script, "Script"),
+        "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
+        "Document" => (ResourceType::Document, "Document"),
+        "XHR" => (ResourceType::Xhr, "XHR"),
+        _ => (ResourceType::Fetch, "Fetch"),
+    };
+    let internal_load = matches!(resource_type,
+        ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document);
     let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
@@ -3356,7 +3366,7 @@ async fn op_fetch_url(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
-            resource_type: "Fetch".to_string(),
+            resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -3375,6 +3385,7 @@ async fn op_fetch_url(
                     record_js_network_completion(&state, JsNetworkEvent {
                         request_id: request_id.clone(), intercepted: true,
                         url: url.clone(), method: method.clone(), status,
+                        resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
@@ -3496,7 +3507,7 @@ async fn op_fetch_url(
                     url: parsed,
                     method: method.clone(),
                     headers: custom_headers.clone(),
-                    resource_type: ResourceType::Fetch,
+                    resource_type,
                 };
                 cbs.fire_request(&info).await;
             }
@@ -3613,6 +3624,10 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                resource_type,
+                resource_type_name,
+                request_id,
+                was_intercepted,
             )
             .await;
         }
@@ -3877,7 +3892,7 @@ async fn op_fetch_url(
                 );
                 let info = RequestInfo {
                     url: resp.url.clone(), method: current_method.as_str().to_string(),
-                    headers: resp_headers.clone(), resource_type: ResourceType::Fetch,
+                    headers: resp_headers.clone(), resource_type,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
@@ -3886,6 +3901,7 @@ async fn op_fetch_url(
             record_js_network_completion(&state, JsNetworkEvent {
                 request_id, intercepted: was_intercepted,
                 url: current_url, method: current_method.as_str().to_string(), status,
+                resource_type: resource_type_name.to_string(),
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
@@ -3920,8 +3936,7 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar. Request identity and destination survive transport selection.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     state: Rc<RefCell<OpState>>,
@@ -3937,6 +3952,10 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
+    resource_type: ResourceType,
+    resource_type_name: &'static str,
+    request_id: String,
+    was_intercepted: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4106,11 +4125,13 @@ async fn stealth_fetch_all(
 
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
+        "requestId": request_id,
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": opaque,
         "headers": script_headers,
     });
+    let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
         let _page_in_flight = page_in_flight;
         let resp_bytes = response.body.await
@@ -4122,11 +4143,21 @@ async fn stealth_fetch_all(
                     resp_bytes.clone(), redirected_from,
                 );
                 let info = RequestInfo {
-                    url: resp.url.clone(), method: current_method,
-                    headers: resp_headers, resource_type: ResourceType::Fetch,
+                    url: resp.url.clone(), method: current_method.clone(),
+                    headers: resp_headers.clone(), resource_type,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
+        }
+        if let Some(state) = body_state.upgrade() {
+            record_js_network_completion(&state, JsNetworkEvent {
+                request_id, intercepted: was_intercepted,
+                url: current_url, method: current_method, status,
+                resource_type: resource_type_name.to_string(),
+                response_headers: resp_headers, body_size: resp_bytes.len(),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64(),
+            }, &String::from_utf8_lossy(&resp_bytes), false);
         }
         Ok(resp_bytes)
     });
