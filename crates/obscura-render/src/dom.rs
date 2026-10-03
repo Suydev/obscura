@@ -6817,10 +6817,7 @@ fn layout_dom_once(
                 width: taffy::AvailableSpace::Definite(initial_cb_width),
                 height: taffy::AvailableSpace::Definite(viewport.1),
             };
-            #[cfg(feature = "paint")]
-            {
-                let engine = &mut engine;
-                let mut measure = |known: taffy::Size<Option<f32>>,
+            let mut measure = |known: taffy::Size<Option<f32>>,
                                    avail: taffy::Size<taffy::AvailableSpace>,
                                    _node,
                                    ctx: Option<&mut usize>,
@@ -6830,6 +6827,9 @@ fn layout_dom_once(
                         None => taffy::Size::ZERO,
                     }
                 };
+
+            #[cfg(feature = "paint")]
+            {
 
                 // Table used-width pass. A grid table is built at width:auto, so
                 // its final width has to be chosen the way CSS chooses a table's
@@ -7359,7 +7359,7 @@ fn layout_dom_once(
             }
             #[cfg(not(feature = "paint"))]
             {
-                let _ = taffy_tree.compute_layout(taffy_root, available);
+                let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 if deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
@@ -7367,19 +7367,20 @@ fn layout_dom_once(
                         &styles,
                         initial_cb_width,
                         |tree, node, width| {
-                            tree.compute_layout(
+                            tree.compute_layout_with_measure(
                                 node,
                                 taffy::Size {
                                     width,
                                     height: taffy::AvailableSpace::MaxContent,
                                 },
+                                &mut measure,
                             )
                             .ok()?;
                             tree.layout(node).ok().map(|layout| layout.size.width)
                         },
                     )
                 {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if resolve_atomic_percentage_heights(
                     tree,
@@ -7389,11 +7390,11 @@ fn layout_dom_once(
                     &styles,
                     &definite_height_nodes,
                 ) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
                 {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 let _ = resolve_deferred_flex_inline_sizes(
                     tree,
@@ -7406,7 +7407,7 @@ fn layout_dom_once(
                     vh,
                     |tree, resolved_styles, phase| match phase {
                         DeferredFlexReflowPhase::Layout => {
-                            let _ = tree.compute_layout(taffy_root, available);
+                            let _ = tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                         }
                         DeferredFlexReflowPhase::FitContent => {
                             if apply_fit_content_widths(
@@ -7415,30 +7416,31 @@ fn layout_dom_once(
                                 resolved_styles,
                                 initial_cb_width,
                                 |tree, node, width| {
-                                    tree.compute_layout(
+                                    tree.compute_layout_with_measure(
                                         node,
                                         taffy::Size {
                                             width,
                                             height: taffy::AvailableSpace::MaxContent,
                                         },
+                                        &mut measure,
                                     )
                                     .ok()?;
                                     tree.layout(node).ok().map(|layout| layout.size.width)
                                 },
                             ) {
-                                let _ = tree.compute_layout(taffy_root, available);
+                                let _ = tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                             }
                         }
                     },
                 );
                 if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_full_span_column_subgrids(
                     tree,
@@ -7446,21 +7448,22 @@ fn layout_dom_once(
                     &id_map,
                     &styles,
                     |tree, node| {
-                        tree.compute_layout(
+                        tree.compute_layout_with_measure(
                             node,
                             taffy::Size {
                                 width: taffy::AvailableSpace::MaxContent,
                                 height: taffy::AvailableSpace::MaxContent,
                             },
+                            &mut measure,
                         )
                         .ok()?;
                         tree.layout(node).ok().map(|layout| layout.size.width)
                     },
                 ) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 // Keep the no-paint geometry path in the same final-position
                 // contract as screenshots: static coordinates are resolved
@@ -7470,7 +7473,7 @@ fn layout_dom_once(
                         &mut taffy_tree,
                         &static_position_candidates,
                     );
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
             }
             sync_resolved_percentage_padding(
@@ -12027,6 +12030,14 @@ fn assign_native_control_size(
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    if stretch_inline || stretch_block {
+        // Stretch controls the final size, not the intrinsic track contribution.
+        // Measure content axes independently; native controls have no natural ratio.
+        style.intrinsic_size = Some((
+            (intrinsic_width - horizontal_edges).max(0.0),
+            (intrinsic_height - vertical_edges).max(0.0),
+        ));
+    }
     if style.width == crate::Dimension::Auto && !stretch_inline {
         let declared = if content_box {
             (intrinsic_width - horizontal_edges).max(0.0)
@@ -12867,6 +12878,15 @@ fn build(
             if !has_in_flow_block_child {
                 taffy_style.flex_wrap = taffy::FlexWrap::NoWrap;
             }
+        }
+    }
+
+    if matches!(_name.local.as_ref(), "input" | "select" | "textarea") {
+        if let Some((width, height)) = style.intrinsic_size {
+            let context = engine.register_native_control(width, height, style);
+            let leaf = taffy_tree.new_leaf_with_context(taffy_style, context).ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
         }
     }
 

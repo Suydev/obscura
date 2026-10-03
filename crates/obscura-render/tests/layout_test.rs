@@ -4424,6 +4424,36 @@ fn grid_replaced_normal_and_explicit_stretch_match_browser_geometry() {
 }
 
 #[test]
+fn nested_grid_input_contributes_intrinsic_height_without_preventing_stretch() {
+    let tree = parse_html(
+        r#"
+        <style>
+          html, body { margin:0; font:14px Arial; line-height:22px }
+          .outer { display:grid; width:214px; align-items:center }
+          .editor { display:inline-grid; grid-area:1 / 1 / 2 / 3;
+                    grid-template-columns:0 min-content }
+          input { display:block; width:100%; grid-area:1 / 2;
+                  font:inherit; min-width:2px; padding:0; border:0 }
+          .short { grid-template-rows:12px }
+        </style>
+        <div class="outer"><div class="editor" id="auto-editor"><input id="auto-input"></div></div>
+        <div class="outer"><div class="editor short" id="short-editor"><input id="short-input"></div></div>
+        "#,
+    );
+    let layout = layout_dom(&tree, (800.0, 600.0));
+    for (input, editor, height) in [
+        ("auto-input", "auto-editor", 22.0),
+        ("short-input", "short-editor", 12.0),
+    ] {
+        let input_rect = layout.rects[&tree.get_element_by_id(input).unwrap()];
+        let editor_rect = layout.rects[&tree.get_element_by_id(editor).unwrap()];
+        assert_eq!(input_rect.height, height, "{input}");
+        assert_eq!(editor_rect.height, height, "{editor}");
+        assert!(input_rect.width >= 2.0, "{input}");
+    }
+}
+
+#[test]
 fn grid_replaced_classification_keeps_controls_stretched_and_media_natural() {
     let tree = parse_html(
         r#"

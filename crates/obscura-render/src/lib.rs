@@ -156,7 +156,9 @@ pub mod inline {
     }
 
     #[derive(Default)]
-    pub struct TextEngine;
+    pub struct TextEngine {
+        controls: Vec<(taffy::Size<f32>, bool)>,
+    }
 
     pub(crate) fn text_may_need_emoji_font(_text: &str) -> bool {
         false
@@ -164,15 +166,44 @@ pub mod inline {
 
     impl TextEngine {
         pub fn new() -> Self {
-            TextEngine
+            Self::default()
         }
 
         pub(crate) fn new_with_web_fonts(_fonts: &[WebFont]) -> Self {
-            TextEngine
+            Self::default()
         }
 
         pub(crate) fn new_with_web_fonts_and_emoji(_fonts: &[WebFont], _load_emoji: bool) -> Self {
-            TextEngine
+            Self::default()
+        }
+
+        pub(crate) fn register_native_control(
+            &mut self, width: f32, height: f32, style: &crate::LayoutStyle,
+        ) -> usize {
+            let index = self.controls.len();
+            let zero_min_content = matches!(style.width, crate::Dimension::Percent(_))
+                || matches!(style.max_width, crate::Dimension::Percent(_))
+                || [0, 4].into_iter().any(|index| style.size_expressions[index]
+                    .as_deref().is_some_and(|expression| expression.contains('%')));
+            self.controls.push((taffy::Size { width, height }, zero_min_content));
+            (1usize << (usize::BITS - 1)) | index
+        }
+
+        pub fn measure_taffy(
+            &mut self, index: usize, known: taffy::Size<Option<f32>>,
+            available: taffy::Size<taffy::AvailableSpace>,
+        ) -> taffy::Size<f32> {
+            let bit = 1usize << (usize::BITS - 1);
+            if index & bit == 0 { return taffy::Size::ZERO; }
+            let (intrinsic, zero_min_content) = self.controls[index & !bit];
+            taffy::Size {
+                width: known.width.unwrap_or_else(|| {
+                    if zero_min_content && matches!(available.width, taffy::AvailableSpace::MinContent) {
+                        0.0
+                    } else { intrinsic.width }
+                }),
+                height: known.height.unwrap_or(intrinsic.height),
+            }
         }
 
         pub fn register_replaced(
@@ -247,7 +278,7 @@ pub mod inline {
     }
 
     pub(crate) fn used_line_height(style: &crate::LayoutStyle) -> f32 {
-        TextEngine.selected_line_height(style)
+        TextEngine::new().selected_line_height(style)
     }
 
     pub(crate) fn is_replaced(local: &str) -> bool {
