@@ -5056,6 +5056,36 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_input_activation_uses_the_receiver_realm() {
+        let mut rt = setup_runtime("<input id='parent' type='checkbox'><iframe></iframe>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = document.querySelector('iframe').contentDocument;
+            child.body.innerHTML = '<input id="control" type="checkbox">';
+            const input = child.getElementById('control');
+            const events = [];
+            input.indeterminate = true;
+            input.addEventListener('click', event => {
+                events.push(['click', input.checked, input.indeterminate]);
+                if (cancel) event.preventDefault();
+            });
+            for (const type of ['input', 'change']) {
+                input.addEventListener(type, () => events.push([type, input.checked, input.indeterminate]));
+            }
+            let cancel = true;
+            HTMLElement.prototype.click.call(input);
+            const cancelled = [input.checked, input.indeterminate,
+                document.getElementById('parent').checked, events.splice(0)];
+            cancel = false;
+            HTMLElement.prototype.click.call(input);
+            return [cancelled, [input.checked, input.indeterminate,
+                document.getElementById('parent').checked, events]];
+        })()"#).unwrap(), serde_json::json!([
+            [false, true, false, [["click", true, false]]],
+            [true, false, false, [["click", true, false], ["input", true, false], ["change", true, false]]]
+        ]));
+    }
+
+    #[test]
     fn document_open_does_not_use_overridden_head_or_body_getters() {
         let mut rt = setup_runtime(
             "<html><head><base href='https://parent.example/'></head><body>parent</body></html>");
