@@ -162,7 +162,15 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 let _realmFrameId = 0;
 
 const _dom = (cmd, a1, a2) => {
-  const result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
+  let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
+  if (result.startsWith('{"__obscuraFrameRetirements":')) {
+    const mutation = JSON.parse(result);
+    result = mutation.result;
+    for (const [id, nid] of mutation.__obscuraFrameRetirements) {
+      const element = _cache.get(nid);
+      if (element && element._frameId === id) _resetIframeElement(element);
+    }
+  }
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
     // Resize observation is tied to rendering-invalidating DOM work. The
@@ -968,8 +976,19 @@ const _scheduleAfter = (delay, fn) => {
     const frameTimerId = -(++_frameTimerSeq);
     const state = { cancelled: false };
     _frameTimerStates.set(frameTimerId, state);
-    __obscuraCore.ops.op_sleep(d).then(() => {
+    __obscuraCore.ops.op_sleep(d, _realmFrameId).then(active => {
       _frameTimerStates.delete(frameTimerId);
+      if (!active || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) < 0) {
+        _frameTimerStates.clear();
+        _timerStates.clear();
+        _nativeTimerIds.clear();
+        _intervals.clear();
+        __obscuraPendingTimeoutDeadlines.clear();
+        _rafPending.clear();
+        _rafFrameScheduled = false;
+        _renderOpportunityScheduled = false;
+        return;
+      }
       if (state.cancelled) return;
       __obscuraCore.ops.op_begin_render_task?.();
       fn();
@@ -2467,7 +2486,10 @@ class Node {
         "NotFoundError",
       );
     }
-    if (n === ref) return n;
+    if (n === ref) {
+      ref = n.nextSibling;
+      if (!ref) return this.appendChild(n);
+    }
     if (n instanceof DocumentFragment) {
       const children = Array.from(n.childNodes);
       for (const child of children) this.insertBefore(child, ref);
@@ -4592,18 +4614,7 @@ class Element extends Node {
     this.setAttribute("src", v);
   }
   _resetIframeFrame() {
-    const oldId = this._frameId;
-    if (oldId) {
-      delete globalThis.__obscura_frameElements[oldId];
-      delete globalThis.__obscura_frameWindows[oldId];
-      delete globalThis.__obscura_frameObjects[oldId];
-    }
-    this._frameId = 0;
-    this._iframeLoadingUrl = null;
-    this._iframeLoadedUrl = 'about:blank';
-    this._iframeDoc = new _IframeDocument(
-      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    _resetIframeElement(this);
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
@@ -4635,7 +4646,7 @@ class Element extends Node {
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
@@ -13852,6 +13863,7 @@ globalThis.__obscura_liveFrameIds = function () {
 // place, so a registry added later cannot be missed by the discard path: any
 // surviving reference keeps the frame's context and DOM tree alive.
 globalThis.__obscura_forgetFrame = function (frameId) {
+  _dom('retire_frame', frameId);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
   delete globalThis.__obscura_frameWindows[frameId];
@@ -13950,7 +13962,7 @@ function _ensureInitialFrameRealm(element) {
     globalThis.__obscura_frameObjects[id] = {
       window: child, document: child.document, initial: true,
     };
-  });
+  }, element._nid);
   if (frameId) {
     element._frameId = frameId;
     element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
@@ -13958,6 +13970,16 @@ function _ensureInitialFrameRealm(element) {
     globalThis.__obscura_frameElements[frameId] = element;
   }
   return frameId !== 0;
+}
+
+function _resetIframeElement(element) {
+  if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
+  element._frameId = 0;
+  element._iframeLoadingUrl = null;
+  element._iframeLoadedUrl = 'about:blank';
+  element._iframeDoc = new _IframeDocument(
+    '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
+  element._iframeWin = new _IframeWindow(element._iframeDoc, 'about:blank');
 }
 
 // The window object this realm uses to stand for frame `frameId`, built once
