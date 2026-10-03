@@ -108,3 +108,35 @@ async fn typing_continues_after_the_inserted_newline() {
     assert_eq!(result["start"], 3);
     assert_eq!(result["end"], 3);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_keydown_preserves_fields_and_delivers_keyup_without_editing_defaults() {
+    let mut ctx = setup().await;
+    for tag in ["input", "textarea"] {
+        evaluate(&mut ctx, &format!(
+            "document.body.innerHTML = '<{tag} id=field></{tag}>'; field.focus();\
+             field.addEventListener('keydown', event => event.preventDefault());\
+             for (const type of ['keydown', 'keypress', 'beforeinput', 'input', 'keyup'])\
+             field.addEventListener(type, event => changes.push(event.type));"
+        )).await;
+        for event_type in ["keyDown", "rawKeyDown"] {
+            for (key, text, virtual_key) in [
+                ("Z", "Z", 90), ("Backspace", "", 8),
+                ("Delete", "", 46), ("Enter", "\r", 13),
+            ] {
+                evaluate(&mut ctx, "field.value = 'abCD'; field.setSelectionRange(1, 3); changes.length = 0;").await;
+                cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
+                    "type": event_type, "key": key, "text": text,
+                    "windowsVirtualKeyCode": virtual_key,
+                })).await;
+                cdp(&mut ctx, "Input.dispatchKeyEvent", json!({
+                    "type": "keyUp", "key": key, "windowsVirtualKeyCode": virtual_key,
+                })).await;
+                assert_eq!(state(&mut ctx).await, json!({
+                    "value": "abCD", "start": 1, "end": 3,
+                    "changes": ["keydown", "keyup"],
+                }), "{tag} {event_type} {key}");
+            }
+        }
+    }
+}

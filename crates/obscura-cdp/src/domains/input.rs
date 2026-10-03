@@ -420,7 +420,7 @@ pub async fn handle(
                             "(function() {{\
                                 var target = document.activeElement || document.body;\
                                 var evt = globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{key},code:{code},keyCode:{virtual_key_code},which:{virtual_key_code},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                target.dispatchEvent(evt);\
+                                return target.dispatchEvent(evt);\
                             }})()",
                             // Escape backslash BEFORE single-quote (as the text
                             // path below does) so a key like "\" — Chrome's
@@ -430,7 +430,9 @@ pub async fn handle(
                             code = js_str(code),
                             virtual_key_code = virtual_key_code,
                         );
-                        page.evaluate(&js);
+                        if page.evaluate(&js).as_bool() == Some(false) {
+                            return Ok(json!({}));
+                        }
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
                             page.evaluate(&insert_text_js(text));
