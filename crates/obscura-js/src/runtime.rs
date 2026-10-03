@@ -20590,6 +20590,34 @@ mod tests {
         assert_eq!(result.value.unwrap(), serde_json::json!(true));
     }
 
+    // body.offsetParent returned body itself, so walking offsetParent to
+    // the top (how pages compute an element's page position) looped forever.
+    #[test]
+    fn test_offset_parent_of_body_and_root_is_null() {
+        let mut rt = setup_runtime(
+            "<html><body><div style=\"position:relative\"><p id=\"p\">x</p></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const walk = [];
+                for (let el = document.getElementById("p"); el && walk.length < 10; el = el.offsetParent) {
+                    walk.push(el.tagName);
+                }
+                return {
+                    body: document.body.offsetParent,
+                    root: document.documentElement.offsetParent,
+                    walk: walk.join(">"),
+                };
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"body": null, "root": null, "walk": "P>DIV>BODY"})
+        );
+    }
+
     #[test]
     fn test_text_decoder_respects_typed_array_view() {
         let mut rt = setup_runtime("<html><body></body></html>");
