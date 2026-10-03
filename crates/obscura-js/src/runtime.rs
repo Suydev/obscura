@@ -5096,6 +5096,89 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[test]
+    fn document_carets_use_shaped_text_and_utf16_offsets() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}span{display:inline-block}</style><span id='text'>A😀BC</span>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            if (typeof document.caretRangeFromPoint !== 'function' ||
+                typeof document.caretPositionFromPoint !== 'function') return 'missing caret API';
+            const element = document.getElementById('text'), text = element.firstChild;
+            const r = element.getBoundingClientRect();
+            const results = [];
+            for (const name of ['caretRangeFromPoint', 'caretPositionFromPoint']) {
+                for (const x of [r.left + .1, r.right - .1]) {
+                    const c = document[name](x, r.top + 12);
+                    results.push([(c.startContainer || c.offsetNode) === text,
+                        c.startOffset ?? c.offset]);
+                }
+                results.push(document[name](-1, 12) === null);
+            }
+            return results;
+        })()"#).unwrap(), serde_json::json!([
+            [true, 0], [true, 5], true, [true, 0], [true, 5], true
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_find_flattened_mixed_content_runs() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}</style><div>AAAA<div style='height:30px'></div><span id='text'>ABCD</span></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const text = document.getElementById('text').firstChild;
+            const caret = document.caretPositionFromPoint(1, 66);
+            return [caret.offsetNode === text, caret.offset];
+        })()"#).unwrap(), serde_json::json!([true, 0]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_legacy_ranges_exclude_widget_internal_text() {
+        let mut rt = setup_runtime("<style>body{margin:0}input,textarea{display:block;border:0;padding:0;font:20px/24px monospace;width:200px;height:24px}</style><div></div><input id='input'><textarea id='textarea'>ABCD</textarea>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const result = [];
+            for (const id of ['input', 'textarea']) {
+                const widget = document.getElementById(id);
+                widget.value = 'A😀BC';
+                const rect = widget.getBoundingClientRect();
+                for (const x of [rect.left + .1, rect.right - .1]) {
+                    const range = document.caretRangeFromPoint(x, rect.top + 12);
+                    result.push([range.startContainer === document.body,
+                        range.startOffset, range.collapsed]);
+                }
+            }
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            [true, 1, true], [true, 1, true], [true, 2, true], [true, 2, true]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_keep_receiver_realm_and_current_geometry() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}#parent{display:inline-block}</style><span id='parent'>ABCD</span>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            if (typeof document.caretPositionFromPoint !== 'function') return 'missing caret API';
+            const iframe = document.createElement('iframe'); iframe.style.display = 'block'; document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>body{margin:0;font:20px/24px monospace}#child{display:inline-block}</style><span id="child">WXYZ</span>';
+            const child = d.getElementById('child'), parent = document.getElementById('parent');
+            const foreign = iframe.contentWindow.Document.prototype;
+            const borrowed = Document.prototype.caretPositionFromPoint.call(d, .1, 12);
+            const reverse = foreign.caretPositionFromPoint.call(document, .1, 12);
+            const position = document.caretPositionFromPoint(.1, 12);
+            const before = position.getClientRect();
+            parent.style.transform = 'translate(40px,50px)';
+            const after = position.getClientRect();
+            let invalid = false;
+            try { document.caretPositionFromPoint(Infinity, 0); } catch (e) { invalid = e instanceof TypeError; }
+            return [borrowed.offsetNode === child.firstChild, reverse.offsetNode === parent.firstChild,
+                position.offset === 0, before.width === 0 && before.height > 0,
+                Math.abs(after.x - before.x - 40) < .01, Math.abs(after.y - before.y - 50) < .01,
+                new Document().caretPositionFromPoint(1, 12) === null, invalid];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
     fn borrowed_document_hit_testing_uses_the_receiver_realm() {
         let mut rt = setup_runtime(
             "<style>body{margin:4px}#parent{width:45px;height:30px}</style><div id='parent'></div>");

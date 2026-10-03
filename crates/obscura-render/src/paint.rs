@@ -1625,6 +1625,64 @@ impl PreparedRender {
         best.map(|(_, _, _, _, id)| id)
     }
 
+    /// Shaped-text caret in the viewport. Hit testing selects the painted
+    /// owner first, so an occluding sibling cannot donate its text cursor.
+    pub fn caret_from_point(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Option<(obscura_dom::tree::NodeId, usize)> {
+        let hit = self.hit_test(tree, scroll, x, y)?;
+        for parent in std::iter::successors(Some(hit), |id| crate::dom::rendered_parent(tree, *id))
+            .take(tree.len() + 1)
+        {
+            let movement = scroll.movement_for(parent);
+            let transform = self.layout.transforms.get(&parent).copied().unwrap_or_default();
+            let Some(inverse) = transform.inverse() else { continue; };
+            let (local_x, local_y) = inverse.map_point(x - movement.0, y - movement.1);
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            let best = indices.filter_map(|index|
+                self.layout.text_engine.caret_from_point(index, parent, tree,
+                    &self.layout.styles, local_x, local_y, hit))
+                .min_by(|a, b| a.2.total_cmp(&b.2));
+            if let Some((node, offset, _)) = best { return Some((node, offset)); }
+        }
+        // Empty rendered line boxes have an element boundary, not a fabricated
+        // text node. This also preserves the caret of an empty editable block.
+        Some((hit, 0))
+    }
+
+    /// Geometry for a previously obtained DOM caret, using current layout and
+    /// scroll rather than the snapshot at the original mouse coordinates.
+    pub fn caret_rect(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        node: obscura_dom::tree::NodeId,
+        offset: usize,
+    ) -> Option<crate::Rect> {
+        for parent in std::iter::successors(crate::dom::rendered_parent(tree, node),
+            |id| crate::dom::rendered_parent(tree, *id)).take(tree.len() + 1)
+        {
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            for index in indices {
+                let Some(rect) = self.layout.text_engine.caret_rect(index, parent,
+                    tree, &self.layout.styles, node, offset) else { continue; };
+                let mut rect = self.layout.transforms.get(&parent).copied()
+                    .unwrap_or_default().map_rect(rect);
+                let movement = scroll.movement_for(parent);
+                rect.x += movement.0;
+                rect.y += movement.1;
+                return Some(rect);
+            }
+        }
+        None
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,

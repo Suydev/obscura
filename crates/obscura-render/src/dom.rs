@@ -13955,7 +13955,7 @@ fn inline_wraps_only_in_flow_blocks(
 /// computed text styles, so removing these wrappers preserves shaping while
 /// exposing block-in-inline descendants early enough for anonymous block
 /// construction.
-fn flatten_boxless_inline_children(
+pub(crate) fn flatten_boxless_inline_children(
     tree: &DomTree,
     children: &[NodeId],
     styles: &HashMap<NodeId, crate::LayoutStyle>,

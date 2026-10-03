@@ -16752,6 +16752,111 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
+// Ops are bound after snapshot restoration, so probe the renderer at realm
+// initialization, not while building the snapshot with an empty op table.
+function _installCaretGeometry() {
+  if (typeof __obscuraCore.ops.op_layout_caret !== 'function') return {};
+  const positions = new WeakMap();
+  function positionState(receiver) {
+    const state = positions.get(receiver);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  }
+  const CaretPosition = class CaretPosition {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get offsetNode() { return positionState(this).node; }
+    get offset() { return positionState(this).offset; }
+    getClientRect() {
+      const { node, offset } = positionState(this);
+      const raw = __obscuraCore.ops.op_layout_caret_rect(String(node._nid), offset, _realmFrameId);
+      const rect = raw ? JSON.parse(raw) : null;
+      return rect ? new DOMRect(rect.x, rect.y, rect.width, rect.height) : new DOMRect();
+    }
+  };
+  Object.defineProperty(globalThis, 'CaretPosition', {
+    value: CaretPosition, writable: true, configurable: true,
+  });
+  Object.defineProperty(CaretPosition.prototype, Symbol.toStringTag, { value: 'CaretPosition', configurable: true });
+  for (const name of ['offsetNode', 'offset', 'getClientRect']) {
+    const descriptor = Object.getOwnPropertyDescriptor(CaretPosition.prototype, name);
+    descriptor.enumerable = true;
+    Object.defineProperty(CaretPosition.prototype, name, descriptor);
+    _markNative(descriptor.value || descriptor.get);
+  }
+  _markNative(CaretPosition);
+  function nativeCaret(receiver, x, y) {
+    if (receiver !== globalThis.document && !(receiver instanceof Document)) throw new TypeError('Illegal invocation');
+    if (receiver._nid !== globalThis.document?._nid) return null;
+    const raw = __obscuraCore.ops.op_layout_caret(x, y, _realmFrameId);
+    if (!raw) return null;
+    const [nid, offset] = JSON.parse(raw);
+    const node = _wrap(nid);
+    return node ? { node, offset } : null;
+  }
+  Document.prototype.caretRangeFromPoint = function caretRangeFromPoint(x = 0, y = 0) {
+    const method = _documentRealmMember(this, 'caretRangeFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
+    // The legacy Chromium extension takes optional signed integer coordinates.
+    const state = nativeCaret(this, +x | 0, +y | 0);
+    if (!state) return null;
+    const range = new Range();
+    // Widget value offsets are not DOM Range boundaries. The legacy API
+    // exposes the position before the control, not its internal editing text.
+    for (let node = state.node; node; node = node.parentNode) {
+      if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+        range.setStartBefore(node);
+        range.collapse(true);
+        return range;
+      }
+    }
+    range.setStart(state.node, state.offset);
+    range.collapse(true);
+    return range;
+  };
+  Document.prototype.caretPositionFromPoint = function caretPositionFromPoint(x, y, options = {}) {
+    const method = _documentRealmMember(this, 'caretPositionFromPoint');
+    if (method) return Reflect.apply(method, this, arguments);
+    if (arguments.length < 2) throw new TypeError('Two coordinates are required');
+    x = +x; y = +y;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new TypeError('Coordinates must be finite');
+    if (options != null && typeof options !== 'object' && typeof options !== 'function') {
+      throw new TypeError('Options must be a dictionary');
+    }
+    const shadowRoots = options?.shadowRoots;
+    if (shadowRoots !== undefined && (shadowRoots == null || typeof shadowRoots[Symbol.iterator] !== 'function')) {
+      throw new TypeError('Shadow roots must be iterable');
+    }
+    const roots = shadowRoots === undefined ? [] : Array.from(shadowRoots);
+    for (const root of roots) {
+      if (!(root instanceof ShadowRoot)) throw new TypeError('Expected a ShadowRoot');
+    }
+    const state = nativeCaret(this, x, y);
+    if (!state) return null;
+    let root = state.node.getRootNode();
+    while (root instanceof ShadowRoot && !roots.some(allowed => {
+      for (let current = allowed; current instanceof ShadowRoot; current = current.host.getRootNode()) {
+        if (current === root) return true;
+      }
+      return false;
+    })) {
+      const host = root.host, parent = host.parentNode;
+      if (!parent) return null;
+      state.offset = Array.prototype.indexOf.call(parent.childNodes, host);
+      state.node = parent;
+      root = parent.getRootNode();
+    }
+    const position = Object.create(CaretPosition.prototype);
+    positions.set(position, state);
+    return position;
+  };
+  _markNative(Document.prototype.caretRangeFromPoint);
+  _markNative(Document.prototype.caretPositionFromPoint);
+  return {
+    caretRangeFromPoint: Document.prototype.caretRangeFromPoint,
+    caretPositionFromPoint: Document.prototype.caretPositionFromPoint,
+  };
+}
+
 // Capture late-defined document members too, before page code can replace them.
 const _documentMembers = Object.freeze(Object.fromEntries(
   ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
@@ -16762,7 +16867,10 @@ const _documentMembers = Object.freeze(Object.fromEntries(
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
-  __obscuraCore.ops.op_register_document_realm(_documentMembers, _realmFrameId);
+  const caretMembers = _installCaretGeometry();
+  __obscuraCore.ops.op_register_document_realm(
+    Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
+    _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
