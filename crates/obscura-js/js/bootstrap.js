@@ -7805,7 +7805,7 @@ globalThis.fetch = async (input, init = {}) => {
   const responseBody = respType === "opaque"
     ? null
     : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
-  const response = new Response(responseBody, {
+  const response = _createInternalResponse(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
@@ -8258,13 +8258,36 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
+let _createInternalResponse;
 if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status === undefined ? 200 : Number(init.status); this.statusText = init.statusText || '';
+  const internalResponseInit = {};
+  const _Response = globalThis.Response = class Response {
+    constructor(body, init = {}, internalInit) {
+      if (init == null) init = {};
+      if (typeof init !== 'object' && typeof init !== 'function') {
+        throw new TypeError('Response init must be a dictionary');
+      }
+      const internal = internalInit === internalResponseInit;
+      const headers = init.headers;
+      const status = init.status;
+      const statusText = init.statusText;
+      this.status = status === undefined ? 200 : (internal ? status : (+status & 0xffff));
+      this.statusText = statusText === undefined ? '' : `${statusText}`;
+      if (!internal) {
+        if (this.status < 200 || this.status > 599) throw new RangeError('Invalid response status');
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError('Invalid response statusText');
+        if (body != null && (this.status === 204 || this.status === 205 || this.status === 304)) {
+          throw new TypeError('Response status cannot have a body');
+        }
+      } else if (this.status === 204 || this.status === 205 || this.status === 304) {
+        body = null;
+      }
+      this._bodyBytes = _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      this.headers = new Headers(headers);
+      this.type = internal ? (init.type || 'default') : 'default';
+      this.url = internal ? (init.url || '') : '';
+      this.redirected = internal && !!init.redirected;
       // #818: body/bodyUsed. A null-body response (null or no body passed)
       // has body === null; every other body is a one-chunk stream, created
       // lazily so merely touching .body does not copy the bytes.
@@ -8320,7 +8343,7 @@ if (typeof Response === 'undefined') {
     async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
     async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
     clone() {
-      const copy = new Response(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+      const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {
         const promise = this._fetchBody.promise.then(bytes => bytes.slice());
         promise.catch(() => {});
@@ -8329,10 +8352,25 @@ if (typeof Response === 'undefined') {
       }
       return copy;
     }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
+    static error() { return _createInternalResponse(null, { status: 0, type: 'error' }); }
+    static redirect(url, status = 302) {
+      url = `${url}`;
+      status = +status & 0xffff;
+      const parsed = new URL(url, document.baseURI);
+      if (![301,302,303,307,308].includes(status)) throw new RangeError('Invalid redirect status');
+      return new Response(null, { status, headers: { Location: parsed.href } });
+    }
+    static json(data, init) {
+      const json = JSON.stringify(data);
+      if (json === undefined) throw new TypeError('Value is not JSON serializable');
+      const response = new Response(new TextEncoder().encode(json), init);
+      if (!response.headers.has('content-type')) response.headers.set('content-type', 'application/json');
+      return response;
+    }
   };
+  _createInternalResponse = (body, init) => new _Response(body, init, internalResponseInit);
+} else {
+  _createInternalResponse = (body, init) => new Response(body, init);
 }
 
 if (!Element.prototype.replaceWith) {
