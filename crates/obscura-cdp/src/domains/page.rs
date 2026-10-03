@@ -1015,6 +1015,10 @@ pub fn emit_navigation_events(
                 session_id: es.clone(),
             });
         }
+        if let Some(error_text) = &net_event.error_text {
+            ctx.pending_events.push(network_loading_failed(net_event, rid, es.clone(), error_text));
+            continue;
+        }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({"requestId": rid, "loaderId": loader_id, "timestamp": net_event.timestamp, "type": net_event.resource_type, "response": {"url": net_event.url, "status": net_event.status, "statusText": "", "headers": &*net_event.response_headers, "mimeType": net_event.response_headers.get("content-type").cloned().unwrap_or_default()}, "frameId": frame_id}),
@@ -1154,6 +1158,10 @@ pub(crate) fn emit_runtime_network_events(
                 session_id: session_id.clone(),
             });
         }
+        if let Some(error_text) = &network_event.error_text {
+            ctx.pending_events.push(network_loading_failed(network_event, request_id, session_id.clone(), error_text));
+            continue;
+        }
         ctx.pending_events.push(CdpEvent {
             method: "Network.responseReceived".into(),
             params: json!({
@@ -1184,6 +1192,19 @@ pub(crate) fn emit_runtime_network_events(
             }),
             session_id: session_id.clone(),
         });
+    }
+}
+
+fn network_loading_failed(
+    event: &obscura_browser::NetworkEvent, request_id: &str,
+    session_id: Option<String>, error_text: &str,
+) -> CdpEvent {
+    CdpEvent {
+        method: "Network.loadingFailed".into(),
+        params: json!({"requestId": request_id, "timestamp": event.timestamp,
+            "type": event.resource_type, "errorText": error_text,
+            "canceled": error_text == "net::ERR_ABORTED"}),
+        session_id,
     }
 }
 
@@ -2070,6 +2091,7 @@ mod tests {
             )])),
             body_size: 12,
             timestamp: 42.0,
+            error_text: None,
         };
 
         emit_runtime_network_events(
@@ -2110,7 +2132,7 @@ mod tests {
         ctx.fetch_intercept.enabled = true;
         emit_navigation_events(
             &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
-            &page_id, &[event], WaitUntil::Load, true,
+            &page_id, std::slice::from_ref(&event), WaitUntil::Load, true,
         );
         let network = ctx.pending_events.iter().filter(|e|
             e.method.starts_with("Network.") || e.method.starts_with("Fetch.")
@@ -2118,6 +2140,28 @@ mod tests {
         assert_eq!(network.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
             ["Network.responseReceived", "Network.loadingFinished"]);
         assert!(network.iter().all(|e| e.params["requestId"] == "fetch-7"));
+
+        let failed = obscura_browser::NetworkEvent {
+            intercepted: false, status: 0, error_text: Some("net::ERR_ABORTED".into()), ..event
+        };
+        ctx.pending_events.clear();
+        emit_runtime_network_events(
+            &mut ctx, &session_id, "frame-1", "https://example.test/", &page_id,
+            std::slice::from_ref(&failed),
+        );
+        assert_eq!(ctx.pending_events.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.requestWillBeSent", "Network.loadingFailed"]);
+        assert_eq!(ctx.pending_events[1].params["requestId"], "fetch-7");
+        assert_eq!(ctx.pending_events[1].params["errorText"], "net::ERR_ABORTED");
+        assert_eq!(ctx.pending_events[1].params["canceled"], true);
+        ctx.pending_events.clear();
+        emit_navigation_events(
+            &mut ctx, &session_id, "frame-1", "loader-current", "https://example.test/",
+            &page_id, &[failed], WaitUntil::Load, true,
+        );
+        assert_eq!(ctx.pending_events.iter().filter(|e| e.method.starts_with("Network."))
+            .map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            ["Network.requestWillBeSent", "Network.loadingFailed"]);
     }
 
     #[test]
@@ -2140,6 +2184,7 @@ mod tests {
             response_headers: std::sync::Arc::new(std::collections::HashMap::new()),
             body_size: 0,
             timestamp: 42.0,
+            error_text: None,
         };
 
         emit_navigation_events(

@@ -93,6 +93,7 @@ pub struct JsNetworkEvent {
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub error_text: Option<String>,
 }
 
 #[cfg(feature = "render")]
@@ -678,6 +679,10 @@ fn record_js_network_completion(
             }
         }
     }
+    push_js_network_event(&mut gs, event);
+}
+
+fn push_js_network_event(gs: &mut ObscuraState, event: JsNetworkEvent) {
     gs.js_network_events.push(event);
     const MAX_JS_NETWORK_EVENTS: usize = 4096;
     if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
@@ -737,6 +742,63 @@ impl Drop for PageInFlightGuard {
     }
 }
 
+struct FetchCancelResource(Rc<CancelHandle>);
+
+impl Resource for FetchCancelResource {
+    fn close(self: Rc<Self>) { self.0.cancel(); }
+}
+
+#[op2(fast)]
+fn op_fetch_cancel_handle(state: &mut OpState) -> u32 {
+    state.resource_table.add(FetchCancelResource(CancelHandle::new_rc()))
+}
+
+// Private signal state survives realm crossings without public prototype
+// forgeries or a native Global handle that would keep dead signals alive.
+#[op2]
+fn op_abort_signal_state<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    value: v8::Local<'s, v8::Value>,
+    initial: v8::Local<'s, v8::Value>,
+) -> v8::Local<'s, v8::Value> {
+    let undefined = v8::undefined(scope).into();
+    let Ok(object) = v8::Local::<v8::Object>::try_from(value) else { return undefined; };
+    let Some(name) = v8::String::new(scope, "obscura.AbortSignal") else { return undefined; };
+    let brand = v8::Private::for_api(scope, Some(name));
+    if !initial.is_undefined() {
+        if object.set_private(scope, brand, initial).unwrap_or(false) { initial } else { undefined }
+    } else {
+        object.get_private(scope, brand).unwrap_or(undefined)
+    }
+}
+
+/// Dropping a request at any await boundary must emit one failure, including
+/// when cancelling the header future or the separately owned response body.
+struct FetchNetworkGuard {
+    state: std::rc::Weak<RefCell<ObscuraState>>,
+    event: Option<JsNetworkEvent>,
+    cancel: Option<Rc<CancelHandle>>,
+}
+
+impl Drop for FetchNetworkGuard {
+    fn drop(&mut self) {
+        let Some(mut event) = self.event.take() else { return; };
+        event.status = 0;
+        event.error_text = Some(if self.cancel.as_ref().is_some_and(|cancel| cancel.is_canceled()) {
+            "net::ERR_ABORTED"
+        } else { "net::ERR_FAILED" }.into());
+        event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs_f64();
+        if let Some(state) = self.state.upgrade() {
+            // Realm teardown can already own this borrow. Never unwind from
+            // a resource destructor into V8 while the document is being freed.
+            if let Ok(mut state) = state.try_borrow_mut() {
+                push_js_network_event(&mut state, event);
+            }
+        }
+    }
+}
+
 struct FetchBodyResource {
     body: RefCell<Option<AsyncResult<Vec<u8>>>>,
     cancel: Rc<CancelHandle>,
@@ -774,6 +836,7 @@ async fn fetch_body_result(
     mut metadata: serde_json::Value,
     body: AsyncResult<Vec<u8>>,
     internal_load: bool,
+    cancel: Option<Rc<CancelHandle>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     if internal_load {
         let bytes = body.await?;
@@ -781,7 +844,7 @@ async fn fetch_body_result(
         metadata["bodyBase64"] = serde_json::json!(BASE64.encode(&bytes));
     } else {
         let rid = state.borrow_mut().resource_table.add(FetchBodyResource {
-            body: RefCell::new(Some(body)), cancel: CancelHandle::new_rc(),
+            body: RefCell::new(Some(body)), cancel: cancel.unwrap_or_else(CancelHandle::new_rc),
             opaque: metadata["opaque"].as_bool().unwrap_or(false),
         });
         metadata["bodyRid"] = serde_json::json!(rid);
@@ -3245,7 +3308,37 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
-    internal_load: bool,
+    #[serde] options: FetchOptions,
+) -> Result<String, deno_error::JsErrorBox> {
+    // Keep the existing op arity rather than exceeding deno_core's
+    // async-op code-generation limit with another positional argument.
+    let (internal_load, cancel_rid) = match options {
+        FetchOptions::Internal(internal) => (internal, None),
+        FetchOptions::Cancelable { cancel_rid } => (false, Some(cancel_rid)),
+    };
+    let cancel = cancel_rid.map(|rid| state.borrow().resource_table.get::<FetchCancelResource>(rid)
+        .map(|resource| resource.0.clone())
+        .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))).transpose()?;
+    let future = fetch_url_inner(state, url, method, headers_json, body, origin, mode, credentials,
+        internal_load, cancel.clone());
+    match cancel {
+        Some(cancel) => future.or_cancel(cancel).await
+            .map_err(|_| deno_error::JsErrorBox::generic("Fetch was cancelled"))?,
+        None => future.await,
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum FetchOptions {
+    Internal(bool),
+    Cancelable { cancel_rid: u32 },
+}
+
+async fn fetch_url_inner(
+    state: Rc<RefCell<OpState>>, url: String, method: String, headers_json: String,
+    body: JsBuffer, origin: String, mode: String, credentials: String,
+    internal_load: bool, cancel: Option<Rc<CancelHandle>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let body = body.to_vec();
     tracing::debug!(
@@ -3336,6 +3429,15 @@ async fn op_fetch_url(
     }
     page_in_flight.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _page_in_flight = PageInFlightGuard(page_in_flight);
+    let mut network_guard = FetchNetworkGuard {
+        state: Rc::downgrade(state.borrow().borrow::<SharedState>()),
+        event: Some(JsNetworkEvent {
+            request_id: request_id.clone(), intercepted: false,
+            url: url.clone(), method: method.clone(), status: 0,
+            response_headers: HashMap::new(), body_size: 0, timestamp: 0.0, error_text: None,
+        }),
+        cancel: cancel.clone(),
+    };
     let credentials = FetchCredentials::parse(&credentials);
 
     // Slots the interception channel can override via Continue so a consumer
@@ -3361,6 +3463,7 @@ async fn op_fetch_url(
         };
         if tx.send(intercepted).is_ok() {
             was_intercepted = true;
+            network_guard.event.as_mut().unwrap().intercepted = true;
             match resolve_rx.await {
                 Ok(InterceptResolution::Fulfill {
                     status,
@@ -3368,12 +3471,14 @@ async fn op_fetch_url(
                     body: b,
                     body_base64: bb,
                 }) => {
+                    network_guard.event = None;
                     // Keep fulfilled responses visible to CDP just like transport
                     // responses, including exact binary bodies and bounded retention.
                     let encoded = !bb.is_empty();
                     let body_size = if encoded { bb.trim_end_matches('=').len() * 3 / 4 } else { b.len() };
                     record_js_network_completion(&state, JsNetworkEvent {
                         request_id: request_id.clone(), intercepted: true,
+                        error_text: None,
                         url: url.clone(), method: method.clone(), status,
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -3394,6 +3499,9 @@ async fn op_fetch_url(
                     return Ok(response.to_string());
                 }
                 Ok(InterceptResolution::Fail { reason }) => {
+                    // The live CDP interception consumer already reports this
+                    // explicit failure. Do not emit a second terminal event.
+                    network_guard.event = None;
                     return Ok(serde_json::json!({
                         "status": 0,
                         "body": "",
@@ -3613,6 +3721,8 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                cancel,
+                network_guard,
             )
             .await;
         }
@@ -3686,20 +3796,13 @@ async fn op_fetch_url(
             req = req.body(current_body.clone());
         }
 
-        if let Some(ref counter) = in_flight {
-            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let resp = req.send().await.map_err(|e| {
-            if let Some(ref counter) = in_flight {
-                counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            deno_error::JsErrorBox::generic(e.to_string())
-        })?;
-
-        if let Some(ref counter) = in_flight {
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        }
+        let resp = {
+            let _in_flight = in_flight.as_ref().map(|counter| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                PageInFlightGuard(counter.clone())
+            });
+            req.send().await.map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?
+        };
 
         if credentials_allowed {
             if let Some(ref jar) = cookie_jar {
@@ -3868,6 +3971,7 @@ async fn op_fetch_url(
     let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
         let _page_in_flight = _page_in_flight;
+        let mut network_guard = network_guard;
         let resp_bytes = read_body_capped(response, fetch_max_body_bytes()).await?;
         if let Some(ref cbs) = callbacks {
             if cbs.has_response_callbacks().await {
@@ -3885,16 +3989,18 @@ async fn op_fetch_url(
         if let Some(state) = body_state.upgrade() {
             record_js_network_completion(&state, JsNetworkEvent {
                 request_id, intercepted: was_intercepted,
+                error_text: None,
                 url: current_url, method: current_method.as_str().to_string(), status,
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
             }, &String::from_utf8_lossy(&resp_bytes), false);
         }
+        network_guard.event = None;
         tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_bytes.len());
         Ok(resp_bytes)
     });
-    fetch_body_result(&state, metadata, body, internal_load).await
+    fetch_body_result(&state, metadata, body, internal_load, cancel).await
 }
 
 /// Assemble a `Response` for the on_response interception callbacks from the
@@ -3937,6 +4043,8 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
+    cancel: Option<Rc<CancelHandle>>,
+    network_guard: FetchNetworkGuard,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4106,13 +4214,16 @@ async fn stealth_fetch_all(
 
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
+        "requestId": network_guard.event.as_ref().unwrap().request_id,
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": opaque,
         "headers": script_headers,
     });
+    let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
         let _page_in_flight = page_in_flight;
+        let mut network_guard = network_guard;
         let resp_bytes = response.body.await
             .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))?;
         if let Some(ref cbs) = callbacks {
@@ -4122,15 +4233,26 @@ async fn stealth_fetch_all(
                     resp_bytes.clone(), redirected_from,
                 );
                 let info = RequestInfo {
-                    url: resp.url.clone(), method: current_method,
-                    headers: resp_headers, resource_type: ResourceType::Fetch,
+                    url: resp.url.clone(), method: current_method.clone(),
+                    headers: resp_headers.clone(), resource_type: ResourceType::Fetch,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
         }
+        if let Some(state) = body_state.upgrade() {
+            let mut event = network_guard.event.take().unwrap();
+            event.url = current_url;
+            event.method = current_method;
+            event.status = status;
+            event.response_headers = resp_headers;
+            event.body_size = resp_bytes.len();
+            event.timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_secs_f64();
+            record_js_network_completion(&state, event, &String::from_utf8_lossy(&resp_bytes), false);
+        } else { network_guard.event = None; }
         Ok(resp_bytes)
     });
-    fetch_body_result(&state, metadata, body, internal_load).await
+    fetch_body_result(&state, metadata, body, internal_load, cancel).await
 }
 
 pub(crate) fn glob_match(pattern: &str, url: &str) -> bool {
@@ -6524,6 +6646,8 @@ pub fn build_extension() -> Extension {
         op_runtime_events_enabled(),
         op_console_msg(),
         op_fetch_url(),
+        op_fetch_cancel_handle(),
+        op_abort_signal_state(),
         op_fetch_body(),
         op_get_cookies(),
         op_set_cookie(),

@@ -7766,15 +7766,42 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, false);
+  const initSignal = init.signal;
+  const inputSignal = initSignal !== undefined ? initSignal : (request ? request.signal : null);
+  if (inputSignal != null && !_abortSignalState(inputSignal)) {
+    throw new TypeError("Failed to execute 'fetch': signal is not an AbortSignal");
+  }
+  const signal = inputSignal == null ? null : _createDependentAbortSignal([inputSignal]);
+  const signalState = signal && _abortSignalState(signal);
+  if (signalState && signalState.aborted) throw signalState.reason;
+  const cancelRid = signal ? __obscuraCore.ops.op_fetch_cancel_handle() : undefined;
+  const cancellation = { rid: cancelRid };
+  const removeAbort = signal ? _addAbortAlgorithm(signal, cancellation, _cancelFetchHandle) : null;
+  const cleanup = () => {
+    if (removeAbort) {
+      removeAbort();
+      _cancelFetchHandle(cancellation);
+    }
+  };
+  let raw;
+  try {
+    raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials,
+      signal ? { cancel_rid: cancelRid } : false);
+  } catch (error) {
+    cleanup();
+    throw signalState && signalState.aborted ? signalState.reason : error;
+  }
+  if (signalState && signalState.aborted) { cleanup(); throw signalState.reason; }
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
+    cleanup();
     const err = new TypeError('net::ERR_FAILED');
     err.name = 'AbortError';
     err.__aborted = true;
     throw err;
   }
   if (parsed.corsBlocked) {
+    cleanup();
     throw new TypeError('Failed to fetch: ' + (parsed.corsError || 'CORS error'));
   }
   const respType = parsed.status === 0 || parsed.opaque ? "opaque" : "basic";
@@ -7790,13 +7817,16 @@ globalThis.fetch = async (input, init = {}) => {
     url: exposeRedirectMetadata ? (parsed.url || url) : (respType === "opaque" ? "" : url),
     redirected: exposeRedirectMetadata && !!parsed.redirected,
   });
+  _attachResponseAbort(response, signal);
   if (typeof parsed.bodyRid === 'number') {
     // ponytail: preserve bounded one-chunk bodies; incremental delivery needs
     // stream backpressure rather than eagerly queuing every network chunk.
-    const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid);
+    const promise = __obscuraCore.ops.op_fetch_body(parsed.bodyRid)
+      .catch(error => { throw signalState && signalState.aborted ? signalState.reason : error; })
+      .finally(cleanup);
     promise.catch(() => {}); // An unread/cancelled body must not report an unhandled rejection.
     response._fetchBody = { promise, resource: { rid: parsed.bodyRid, consumers: 1 } };
-  }
+  } else cleanup();
   if (parsed.requestId) {
     Object.defineProperty(response, "__obscuraRequestId", {
       value: parsed.requestId,
@@ -8192,7 +8222,11 @@ if (typeof Request === 'undefined') {
       }
       this.redirect = init.redirect || 'follow';
       this.referrer = init.referrer || '';
-      this.signal = init.signal || { aborted: false, addEventListener(){}, removeEventListener(){} };
+      const signal = init.signal;
+      if (signal != null && !_abortSignalState(signal)) {
+        throw new TypeError("Failed to construct 'Request': signal is not an AbortSignal");
+      }
+      this.signal = _createDependentAbortSignal(signal == null ? [] : [signal]);
       this.cache = init.cache || 'default';
     }
     clone() {
@@ -8249,10 +8283,13 @@ if (typeof Response === 'undefined') {
       this._bodyStream = null;
       this._bodyUsed = false;
       this._fetchBody = null;
+      this._bodyAborted = false;
+      this._bodyAbortReason = undefined;
     }
     _consumeBody() {
       if (this._bodyUsed) throw new TypeError("Body is already consumed");
       this._bodyUsed = true;
+      if (this._bodyAborted) throw this._bodyAbortReason;
     }
     get body() {
       if (this._bodyNull) return null;
@@ -8260,6 +8297,7 @@ if (typeof Response === 'undefined') {
       if (!this._bodyStream) {
         this._bodyStream = new ReadableStream({
           start: (controller) => {
+            if (this._bodyAborted) { controller.error(this._bodyAbortReason); return; }
             const deliver = (bytes) => {
               if (bytes.length) controller.enqueue(bytes);
               controller.close();
@@ -8304,6 +8342,7 @@ if (typeof Response === 'undefined') {
         this._fetchBody.resource.consumers++;
         copy._fetchBody = { promise, resource: this._fetchBody.resource };
       }
+      _attachResponseAbort(copy, this._bodySignal);
       return copy;
     }
     static error() { return new Response(null, { status: 0 }); }
@@ -10785,8 +10824,74 @@ _markNative(globalThis.StorageEvent);
 // prototype, so feature-detection and `AbortSignal.prototype` access work. It
 // carries aborted/reason, supports throwIfAborted(), and fires "abort" to
 // onabort and addEventListener listeners when the controller aborts.
+const _abortSignalStates = new WeakMap();
+function _abortSignalState(signal) {
+  let state = _abortSignalStates.get(signal);
+  if (!state) {
+    state = __obscuraCore.ops.op_abort_signal_state(signal, undefined);
+    if (state) _abortSignalStates.set(signal, state);
+  }
+  return state;
+}
+function _retainObservedSignal(signal) {
+  const state = _abortSignalState(signal);
+  const retained = !state.aborted && (state.listeners.length || state.onabort || state.algorithms.size)
+    ? signal : undefined;
+  for (const source of state.sources) {
+    const parent = source.deref();
+    if (parent) _abortSignalState(parent).dependents.set(state.ref, retained);
+  }
+}
+const _abortAlgorithmFinalizer = new FinalizationRegistry(({source, algorithm}) => {
+  const signal = source.deref();
+  if (signal) {
+    _abortSignalState(signal).algorithms.delete(algorithm);
+    _retainObservedSignal(signal);
+  }
+});
+// Keep weak callbacks in their own scope: finalizer holdings must not capture
+// the registration's target or its returned cleanup closure.
+function _weakAbortAlgorithm(target, source, callback) {
+  return () => {
+    const value = target.deref(), signal = source.deref();
+    if (value && signal) callback(value, _abortSignalState(signal).reason);
+  };
+}
+function _addAbortAlgorithm(signal, target, callback) {
+  const state = _abortSignalState(signal);
+  if (state.aborted) { callback(target, state.reason); return () => {}; }
+  const algorithm = _weakAbortAlgorithm(new WeakRef(target), state.ref, callback);
+  state.algorithms.add(algorithm);
+  _abortAlgorithmFinalizer.register(target, {source:state.ref, algorithm}, algorithm);
+  _retainObservedSignal(signal);
+  return () => {
+    state.algorithms.delete(algorithm);
+    _abortAlgorithmFinalizer.unregister(algorithm);
+    _retainObservedSignal(signal);
+  };
+}
+function _cancelFetchHandle(handle) { __obscuraCore.ops.op_try_close(handle.rid); }
+function _abortResponseBody(response, reason) {
+  if (response._bodyStream && response._bodyStream._state !== 'readable') return;
+  response._bodyAborted = true;
+  response._bodyAbortReason = reason;
+  if (response._bodyStream) response._bodyStream._controller.error(reason);
+}
+function _attachResponseAbort(response, signal) {
+  if (signal && !response._bodyNull) {
+    response._bodySignal = signal;
+    _addAbortAlgorithm(signal, response, _abortResponseBody);
+  }
+}
+let _createDependentAbortSignal;
 (function () {
   const BRAND = Symbol("AbortSignal");
+  const dependentsFinalizer = new FinalizationRegistry(({sources, ref}) => {
+    for (const source of sources) {
+      const signal = source.deref();
+      if (signal) _abortSignalState(signal).dependents.delete(ref);
+    }
+  });
   function emit(signal, evt) {
     if (typeof signal.onabort === "function") {
       try { signal.onabort.call(signal, evt); } catch (_) {}
@@ -10796,36 +10901,70 @@ _markNative(globalThis.StorageEvent);
       if (typeof fn === "function") { try { fn.call(signal, evt); } catch (_) {} }
     }
   }
-  function fire(signal, reason) {
-    if (signal._aborted) return;
-    signal._aborted = true;
-    signal._reason = reason !== undefined
-      ? reason
-      : new DOMException("signal is aborted without reason", "AbortError");
+  function runAbortSteps(signal) {
+    const state = _abortSignalState(signal);
+    for (const algorithm of state.algorithms) algorithm();
+    state.algorithms.clear();
+    for (const source of state.sources) {
+      const parent = source.deref();
+      if (parent) _abortSignalState(parent).dependents.delete(state.ref);
+    }
+    state.sources.clear();
+    dependentsFinalizer.unregister(state.ref);
+    state.dependents.clear();
     const evt = typeof Event === "function" ? new Event("abort") : { type: "abort" };
+    _trustedEvents.add(evt);
     try { evt.target = signal; evt.currentTarget = signal; } catch (_) {}
     emit(signal, evt);
+  }
+  function fire(signal, reason) {
+    const state = _abortSignalState(signal);
+    if (state.aborted) return;
+    state.aborted = true;
+    state.reason = reason !== undefined
+      ? reason
+      : new DOMException("signal is aborted without reason", "AbortError");
+    const pending = [];
+    for (const ref of state.dependents.keys()) {
+      const dependent = ref.deref();
+      if (!dependent) continue;
+      const child = _abortSignalState(dependent);
+      if (child.aborted) continue;
+      child.aborted = true;
+      child.reason = state.reason;
+      pending.push(dependent);
+    }
+    runAbortSteps(signal);
+    for (const dependent of pending) runAbortSteps(dependent);
   }
   globalThis.AbortSignal = class AbortSignal {
     constructor(brand) {
       if (brand !== BRAND) {
         throw new TypeError("Failed to construct 'AbortSignal': Illegal constructor");
       }
-      this._aborted = false;
-      this._reason = undefined;
-      this._listeners = [];
-      this.onabort = null;
+      const state = {aborted:false, reason:undefined, listeners:[], onabort:null,
+        algorithms:new Set(), sources:new Set(), dependents:new Map(), dependent:false,
+        ref:new WeakRef(this)};
+      __obscuraCore.ops.op_abort_signal_state(this, state);
+      _abortSignalStates.set(this, state);
     }
-    get aborted() { return this._aborted; }
-    get reason() { return this._reason; }
-    throwIfAborted() { if (this._aborted) throw this._reason; }
+    get _listeners() { return _abortSignalState(this).listeners; }
+    get aborted() { return _abortSignalState(this).aborted; }
+    get reason() { return _abortSignalState(this).reason; }
+    get onabort() { return _abortSignalState(this).onabort; }
+    set onabort(callback) {
+      _abortSignalState(this).onabort = typeof callback === 'function' ? callback : null;
+      _retainObservedSignal(this);
+    }
+    throwIfAborted() { const state = _abortSignalState(this); if (state.aborted) throw state.reason; }
     addEventListener(type, cb) {
-      if (type === "abort" && cb != null) this._listeners.push(cb);
+      if (type === "abort" && cb != null) { this._listeners.push(cb); _retainObservedSignal(this); }
     }
     removeEventListener(type, cb) {
       if (type !== "abort") return;
       const i = this._listeners.indexOf(cb);
       if (i >= 0) this._listeners.splice(i, 1);
+      _retainObservedSignal(this);
     }
     dispatchEvent(evt) {
       if (evt && evt.type === "abort") emit(this, evt);
@@ -10833,8 +10972,9 @@ _markNative(globalThis.StorageEvent);
     }
     static abort(reason) {
       const s = new AbortSignal(BRAND);
-      s._aborted = true;
-      s._reason = reason !== undefined
+      const state = _abortSignalState(s);
+      state.aborted = true;
+      state.reason = reason !== undefined
         ? reason
         : new DOMException("signal is aborted without reason", "AbortError");
       return s;
@@ -10845,18 +10985,33 @@ _markNative(globalThis.StorageEvent);
       return s;
     }
     static any(signals) {
-      const s = new AbortSignal(BRAND);
-      const list = Array.from(signals || []);
-      for (const sig of list) {
-        if (sig && sig.aborted) { s._aborted = true; s._reason = sig.reason; return s; }
-      }
-      for (const sig of list) {
-        if (sig && typeof sig.addEventListener === "function") {
-          sig.addEventListener("abort", () => fire(s, sig.reason));
-        }
-      }
-      return s;
+      return _createDependentAbortSignal(Array.from(signals));
     }
+  };
+  const Signal = globalThis.AbortSignal;
+  _createDependentAbortSignal = function(signals) {
+    const states = signals.map(signal => {
+      const state = _abortSignalState(signal);
+      if (!state) throw new TypeError('signal is not an AbortSignal');
+      return state;
+    });
+    const signal = new Signal(BRAND), state = _abortSignalState(signal);
+    for (const parent of states) {
+      if (parent.aborted) { state.aborted = true; state.reason = parent.reason; return signal; }
+    }
+    state.dependent = true;
+    for (const parent of states) {
+      const sources = parent.dependent ? parent.sources : [parent.ref];
+      for (const source of sources) {
+        const root = source.deref();
+        if (!root || state.sources.has(source)) continue;
+        state.sources.add(source);
+        _abortSignalState(root).dependents.set(state.ref, undefined);
+      }
+    }
+    if (state.sources.size) dependentsFinalizer.register(signal,
+      {sources:Array.from(state.sources), ref:state.ref}, state.ref);
+    return signal;
   };
   globalThis.AbortController = class AbortController {
     constructor() { this.signal = new globalThis.AbortSignal(BRAND); }
@@ -15303,29 +15458,36 @@ if (typeof ReadableStream === 'undefined') {
       this._source = source;
       this._queue = [];
       this._reads = [];
+      this._closedWaiters = [];
+      this._closeRequested = false;
       this._state = "readable";
       this._error = null;
       this.locked = false;
       const stream = this;
       this._controller = {
         enqueue(chunk) {
-          if (stream._state !== "readable") return;
+          if (stream._state !== "readable" || stream._closeRequested) return;
           const pending = stream._reads.shift();
           if (pending) pending.resolve({value: chunk, done: false});
           else stream._queue.push(chunk);
         },
         close() {
           if (stream._state !== "readable") return;
+          stream._closeRequested = true;
+          if (stream._queue.length) return;
           stream._state = "closed";
           while (stream._reads.length) {
             stream._reads.shift().resolve({value: undefined, done: true});
           }
+          while (stream._closedWaiters.length) stream._closedWaiters.shift().resolve();
         },
         error(error) {
           if (stream._state !== "readable") return;
           stream._state = "errored";
           stream._error = error;
+          stream._queue.length = 0;
           while (stream._reads.length) stream._reads.shift().reject(error);
+          while (stream._closedWaiters.length) stream._closedWaiters.shift().reject(error);
         },
         get desiredSize() { return Math.max(0, 1 - stream._queue.length); },
       };
@@ -15342,9 +15504,14 @@ if (typeof ReadableStream === 'undefined') {
       if (this.locked) throw new TypeError("ReadableStream is locked");
       this.locked = true;
       const stream = this;
+      let closedPromise;
       return {
         read() {
-          if (stream._queue.length > 0) return Promise.resolve({ value: stream._queue.shift(), done: false });
+          if (stream._queue.length > 0) {
+            const value = stream._queue.shift();
+            if (!stream._queue.length && stream._closeRequested) stream._controller.close();
+            return Promise.resolve({ value, done: false });
+          }
           if (stream._state === "closed") return Promise.resolve({ value: undefined, done: true });
           if (stream._state === "errored") return Promise.reject(stream._error);
           return new Promise((resolve, reject) => stream._reads.push({resolve, reject}));
@@ -15352,16 +15519,15 @@ if (typeof ReadableStream === 'undefined') {
         releaseLock() { stream.locked = false; },
         cancel(reason) { return stream.cancel(reason); },
         get closed() {
-          if (stream._state === "closed") return Promise.resolve();
-          if (stream._state === "errored") return Promise.reject(stream._error);
-          return new Promise((resolve, reject) => {
-            const poll = () => {
+          if (!closedPromise) {
+            closedPromise = new Promise((resolve, reject) => {
               if (stream._state === "closed") resolve();
               else if (stream._state === "errored") reject(stream._error);
-              else setTimeout(poll, 0);
-            };
-            poll();
-          });
+              else stream._closedWaiters.push({resolve, reject});
+            });
+            closedPromise.catch(() => {});
+          }
+          return closedPromise;
         },
       };
     }

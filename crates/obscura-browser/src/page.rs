@@ -186,6 +186,7 @@ pub struct NetworkEvent {
     pub response_headers: Arc<std::collections::HashMap<String, String>>,
     pub body_size: usize,
     pub timestamp: f64,
+    pub error_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4266,6 +4267,7 @@ impl Page {
                 response_headers: Arc::new(ev.response_headers),
                 body_size: ev.body_size,
                 timestamp: ev.timestamp,
+                error_text: ev.error_text,
             });
         }
     }
@@ -4568,6 +4570,7 @@ impl Page {
             response_headers: Arc::new(response_headers.clone()),
             body_size,
             timestamp,
+            error_text: None,
         });
         request_id
     }
