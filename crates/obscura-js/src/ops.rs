@@ -2759,6 +2759,68 @@ fn op_runtime_events_enabled(state: &OpState) -> bool {
         .runtime_events_enabled
 }
 
+pub(crate) fn record_uncaught_exception(
+    state: &mut ObscuraState,
+    error: &deno_core::error::JsError,
+    fallback_url: &str,
+) {
+    if !state.runtime_events_enabled {
+        return;
+    }
+    state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+    let first = error.frames.first();
+    let url = first
+        .and_then(|frame| frame.file_name.clone())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| fallback_url.to_string());
+    let line_number = first.and_then(|frame| frame.line_number).unwrap_or(1).saturating_sub(1);
+    let column_number = first.and_then(|frame| frame.column_number).unwrap_or(1).saturating_sub(1);
+    let stack_trace = error.frames.iter().map(|frame| {
+        serde_json::json!({
+            "functionName": frame.function_name.as_deref().unwrap_or(""),
+            "scriptId": "",
+            "url": frame.file_name.as_deref().unwrap_or(fallback_url),
+            "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+            "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+        })
+    }).collect();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64() * 1_000.0;
+    if state.pending_runtime_events.len() >= 1_024 {
+        state.pending_runtime_events.pop_front();
+    }
+    state.pending_runtime_events.push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
+        exception_id: state.runtime_exception_counter,
+        name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
+        description: error.stack.clone().unwrap_or_else(|| error.exception_message.clone()),
+        url,
+        line_number,
+        column_number,
+        stack_trace,
+        timestamp,
+    }));
+}
+
+#[op2(nofast)]
+fn op_report_browser_exception<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    state: &OpState,
+    error: v8::Local<'s, v8::Value>,
+    frame_id: u32,
+) {
+    let Some(owner) = posted_task_owner(state, frame_id) else { return; };
+    let Ok(page) = owner.try_borrow() else { return; };
+    if !page.runtime_events_enabled { return; }
+    let url = page.url.clone();
+    drop(page);
+    let error = deno_core::error::JsError::from_v8_exception(scope, error);
+    if let Ok(mut page) = owner.try_borrow_mut() {
+        record_uncaught_exception(&mut page, &error, &url);
+    };
+}
+
 #[op2(fast)]
 fn op_console_msg(
     state: &OpState,
@@ -6523,6 +6585,7 @@ pub fn build_extension() -> Extension {
         op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),
         op_console_msg(),
+        op_report_browser_exception(),
         op_fetch_url(),
         op_fetch_body(),
         op_get_cookies(),
