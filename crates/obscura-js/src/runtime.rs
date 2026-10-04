@@ -802,6 +802,10 @@ impl ObscuraJsRuntime {
             realm_ctx.set_aligned_pointer_in_embedder_data(CONTEXT_STATE_SLOT_INDEX, cs);
             realm_ctx.set_aligned_pointer_in_embedder_data(MODULE_MAP_SLOT_INDEX, mm);
         }
+        // These borrowed native fields need no Rust slot annex. Leaving its
+        // weak finalizer alive until isolate disposal can access freed memory
+        // in rusty_v8; clearing it now preserves the native fields (#1161).
+        realm_ctx.clear_all_slots();
     }
 
     pub(crate) fn share_ops_with_realm(
@@ -5017,6 +5021,67 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             ["BackCompat", null, [1], "HTML", "HEAD", "BODY"], "CSS1Compat"
         ]));
+    }
+
+    #[test]
+    fn retained_initial_frame_contexts_survive_runtime_teardown_under_gc_stress() {
+        crate::set_v8_flags("--stress-compaction --stress-marking=1");
+        for _ in 0..10 {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            assert_eq!(rt.evaluate(r#"(() => {
+                globalThis.retainedFrames = [];
+                for (let i = 0; i < 4; i++) {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const child = frame.contentWindow;
+                    child.document.body.textContent = 'retained';
+                    retainedFrames.push(child);
+                    frame.remove();
+                }
+                return retainedFrames.map(child => child.document.body.textContent);
+            })()"#).unwrap(), serde_json::json!(["retained", "retained", "retained", "retained"]));
+            drop(rt);
+        }
+    }
+
+    #[test]
+    fn document_realm_registration_preserves_main_context_rust_slots() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.expose_ops_for_tests();
+        {
+            let mut entered = rt.runtime();
+            let context = entered.main_context();
+            v8::scope_with_context!(scope, entered.v8_isolate(), context);
+            scope.get_current_context().set_slot(Rc::new(String::from("main context state")));
+        }
+        rt.evaluate("__obscura_test_ops.op_register_document_realm({}, 123)").unwrap();
+        let mut entered = rt.runtime();
+        let context = entered.main_context();
+        v8::scope_with_context!(scope, entered.v8_isolate(), context);
+        assert_eq!(scope.get_current_context().get_slot::<String>().as_deref().map(String::as_str),
+            Some("main context state"));
+    }
+
+    #[test]
+    fn document_realm_registration_with_zero_id_survives_teardown_under_gc_stress() {
+        crate::set_v8_flags("--stress-compaction --stress-marking=1");
+        for _ in 0..10 {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.expose_ops_for_tests();
+            assert_eq!(rt.evaluate(r#"(() => {
+                globalThis.retainedFrames = [];
+                for (let i = 0; i < 4; i++) {
+                    const frame = document.createElement('iframe');
+                    document.body.appendChild(frame);
+                    const child = frame.contentWindow;
+                    __obscura_test_ops.op_register_document_realm(child.eval('({})'), 0);
+                    retainedFrames.push(child);
+                    frame.remove();
+                }
+                return retainedFrames.length;
+            })()"#).unwrap(), serde_json::json!(4.0));
+            drop(rt);
+        }
     }
 
     #[test]

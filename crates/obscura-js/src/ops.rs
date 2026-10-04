@@ -5868,6 +5868,14 @@ fn op_register_document_realm(
         context.set_embedder_data(DOCUMENT_MEMBERS_SLOT, members.into());
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         context.set_embedder_data(DOCUMENT_OWNER_SLOT, id.into());
+        if context != scope.get_current_context() {
+            // Frame contexts own no Rust typed slots. Discard the empty annex
+            // created by these setters while the isolate is alive (#1161).
+            // Traced native embedder fields remain intact; deno_core cleans up
+            // the main context's annex itself. The shared op runs in main, so
+            // compare native identity, not the script-provided frame id.
+            context.clear_all_slots();
+        }
     }
 }
 
@@ -5933,6 +5941,7 @@ fn op_initial_frame(
                 context.set_aligned_pointer_in_embedder_data(index, pointer);
             }
         }
+        context.clear_all_slots();
         context.set_security_token(parent_context.get_security_token(scope));
         let mut child = ObscuraState::new();
         #[cfg(feature = "render")]
