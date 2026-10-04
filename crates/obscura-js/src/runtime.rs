@@ -19994,6 +19994,318 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_prevents_pre_aborted_requests_from_reaching_transport() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/resource", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = 0;
+            while let Ok(Ok((mut stream, _))) = tokio::time::timeout(
+                std::time::Duration::from_millis(500), listener.accept(),
+            ).await {
+                let mut buffer = [0u8; 4096];
+                stream.read(&mut buffer).await.unwrap();
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\
+                    Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\nok").await.unwrap();
+                requests += 1;
+            }
+            requests
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        let result = rt.call_function_on_for_cdp(&format!(r#"async () => {{
+            const reason = {{ why: 'cancelled' }};
+            const controller = new AbortController(); controller.abort(reason);
+            const inherited = new Request({target:?}, {{ signal: controller.signal }});
+            const results = [];
+            for (const [input, init] of [[{target:?}, {{signal:controller.signal}}], [inherited, {{}}]]) {{
+                results.push(await fetch(input, init).then(() => false, error => error === reason));
+            }}
+            // An explicit null overrides an inherited aborted signal.
+            results.push(await fetch(inherited, {{signal:null}}).then(r => r.text()) === 'ok');
+            return results;
+        }}"#), None, &[], true, true).await.unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([true, true, true])));
+        assert_eq!(requests, 1, "only the explicit signal override may reach the server");
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_accepts_cross_realm_signals_but_rejects_forged_prototypes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const frame = document.createElement('iframe'); document.body.appendChild(frame);
+            const controller = new frame.contentWindow.AbortController();
+            const reason = { cancelled: true }; controller.abort(reason);
+            const outcomes = [];
+            outcomes.push(await fetch('https://example.com/', {signal:controller.signal})
+                .then(() => false, error => error === reason));
+            try {
+                const request = new Request('https://example.com/', {signal:controller.signal});
+                outcomes.push(await fetch(request).then(() => false, error => error === reason));
+            } catch (_) { outcomes.push(false); }
+            const forged = Object.create(AbortSignal.prototype);
+            outcomes.push(await fetch('https://example.com/', {signal:forged})
+                .then(() => false, error => error instanceof TypeError));
+            try { new Request('https://example.com/', {signal:forged}); outcomes.push(false); }
+            catch (error) { outcomes.push(error instanceof TypeError); }
+            return outcomes;
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([true, true, true, true])));
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_reads_signal_getters_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const reason = { cancelled: true };
+            const signal = AbortSignal.abort(reason);
+            let fetchReads = 0, requestReads = 0;
+            const rejected = await fetch('https://example.com/', {
+                get signal() { fetchReads++; return signal; }
+            }).then(() => false, error => error === reason);
+            const request = new Request('https://example.com/', {
+                get signal() { requestReads++; return signal; }
+            });
+            return [rejected, request.signal.aborted, fetchReads, requestReads];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([true, true, 1, 1])));
+    }
+
+    #[test]
+    fn request_signals_follow_sources_without_aliasing_or_reordering_abort_events() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const controller = new AbortController();
+            const request = new Request('https://example.com/', {signal:controller.signal});
+            const clone = request.clone();
+            const nested = AbortSignal.any([request.signal,clone.signal]);
+            const reason = {cancelled:true};
+            const order = [];
+            controller.signal.addEventListener('abort', () => {
+                order.push(['parent',request.signal.aborted,clone.signal.aborted,nested.aborted]);
+            });
+            request.signal.addEventListener('abort',()=>order.push(['request']));
+            clone.signal.addEventListener('abort',()=>order.push(['clone']));
+            nested.addEventListener('abort',()=>order.push(['nested']));
+            const distinct = request.signal !== controller.signal && clone.signal !== request.signal;
+            controller.abort(reason);
+            return {distinct,order,reasons:request.signal.reason===reason &&
+                clone.signal.reason===reason && nested.reason===reason};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "distinct": true,
+            "order": [["parent",true,true,true],["request"],["clone"],["nested"]],
+            "reasons": true,
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_errors_completed_unread_response_streams() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/resource", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\
+                Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\ntail").await.unwrap();
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.execute_script("completed-abort-fetch", &format!(r#"
+            globalThis.completedController = new AbortController();
+            globalThis.completedReader = null;
+            fetch({target:?}, {{signal:completedController.signal}}).then(response => {{
+                completedReader = response.body.getReader();
+                globalThis.completedClosed = completedReader.closed.then(
+                    () => false, error => error.name === 'AbortError');
+            }});
+        "#)).unwrap();
+        assert!(rt.resolve_promises_until(|rt| {
+            rt.evaluate("completedReader !== null").unwrap() == serde_json::json!(true)
+                && !rt.has_pending_network_requests()
+        }, 2_000).await, "the body must complete before abort");
+        server.await.unwrap();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            completedController.abort();
+            return [await completedReader.read().then(
+                () => false, error => error.name === 'AbortError'), await completedClosed];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([true,true])));
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[test]
+    fn request_following_signals_are_collectible_without_observers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("signal-lifetime", r#"
+            globalThis.lifetimeController = new AbortController();
+            globalThis.unobservedSignals = Array.from({length:64}, () => new WeakRef(
+                new Request('https://example.com/', {signal:lifetimeController.signal}).signal));
+            globalThis.lifetimeEvents = [];
+            (() => {
+                const signal = new Request('https://example.com/', {signal:lifetimeController.signal}).signal;
+                signal.addEventListener('abort', () => lifetimeEvents.push('listener'));
+                globalThis.observedSignal = new WeakRef(signal);
+                const handler = new Request('https://example.com/', {signal:lifetimeController.signal}).signal;
+                handler.onabort = () => lifetimeEvents.push('handler');
+                globalThis.handlerSignal = new WeakRef(handler);
+            })();
+        "#).unwrap();
+        // End the WeakRef keep-alive job before an explicit native collection.
+        rt.runtime().v8_isolate().clear_kept_objects();
+        rt.collect_garbage();
+        let result = rt.evaluate(r#"(() => {
+            const live = unobservedSignals.filter(ref => ref.deref() !== undefined).length;
+            const observed = observedSignal.deref() !== undefined && handlerSignal.deref() !== undefined;
+            lifetimeController.abort();
+            return {live,observed,events:lifetimeEvents};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "live": 0, "observed": true, "events": ["listener","handler"],
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_errors_fulfilled_response_clones_without_native_body_resources() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        rt.set_intercept_tx(tx);
+        rt.set_intercept_enabled(true);
+        let fetch = rt.call_function_on_for_cdp(r#"async () => {
+            const controller = new AbortController();
+            const response = await fetch('https://example.com/resource', {signal:controller.signal});
+            const copy = response.clone();
+            const lazy = copy.clone();
+            const reader = copy.body.getReader();
+            const closed = reader.closed.then(() => false, error => error.name === 'AbortError');
+            const original = await response.text();
+            controller.abort();
+            return [original, await reader.read().then(() => false, error => error.name === 'AbortError'),
+                await closed, await lazy.text().then(() => false, error => error.name === 'AbortError')];
+        }"#, None, &[], true, true);
+        let fulfill = async {
+            let request = rx.recv().await.expect("intercepted fetch");
+            request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                status: 200, headers: std::collections::HashMap::new(),
+                body: "fulfilled body".into(), body_base64: String::new(),
+            }).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3),
+            async { tokio::join!(fetch, fulfill) }).await.expect("fulfilled fetch completion");
+        assert_eq!(result.unwrap().value, Some(serde_json::json!(["fulfilled body",true,true,true])));
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    #[test]
+    fn abort_signal_generated_events_are_trusted_but_author_events_are_not() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const controller = new AbortController();
+            const signal = controller.signal;
+            const events = [];
+            signal.addEventListener('abort', event => events.push({
+                trusted:event.isTrusted,
+                bubbles:event.bubbles, cancelable:event.cancelable
+            }));
+            signal.dispatchEvent(new Event('abort'));
+            controller.abort(); controller.abort();
+            return events;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            {"trusted":false,"bubbles":false,"cancelable":false},
+            {"trusted":true,"bubbles":false,"cancelable":false},
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_does_not_call_overridden_public_signal_event_methods() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const controller = new AbortController();
+            controller.signal.addEventListener = controller.signal.removeEventListener = () => {
+                throw new Error('public event method invoked');
+            };
+            const fetching = fetch('data:text/plain,complete', {signal:controller.signal});
+            controller.abort();
+            return fetching.then(() => false, error => error === controller.signal.reason);
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!(true)));
+        assert!(!rt.has_pending_network_requests());
+    }
+
+    async fn check_fetch_abort_transport(after_headers: bool) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}/resource", listener.local_addr().unwrap());
+        let (accepted_tx, mut accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            if after_headers {
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\
+                    Access-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+            accepted_tx.send(()).unwrap();
+            // No timed response: cancellation must actually close this socket.
+            tokio::time::timeout(std::time::Duration::from_secs(3), stream.read(&mut request)).await
+        });
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let client = std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        ));
+        rt.set_http_client(client.clone());
+        #[cfg(feature = "stealth")]
+        rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::with_proxy(
+            client.cookie_jar.clone(), None, true,
+        )));
+        rt.execute_script("start-abort-fetch", &format!(r#"
+            globalThis.abortController = new AbortController();
+            globalThis.abortOutcome = null; globalThis.abortHeaders = false;
+            fetch({target:?}, {{ signal: abortController.signal }}).then(response => {{
+                abortHeaders = response.status === 200; return response.text();
+            }}).then(() => abortOutcome = 'resolved', error => abortOutcome = error.name);
+        "#)).unwrap();
+        let mut accepted = false;
+        assert!(rt.resolve_promises_until(|rt| {
+            accepted |= accepted_rx.try_recv().is_ok();
+            accepted && (!after_headers || rt.evaluate("abortHeaders").unwrap() == serde_json::json!(true))
+        }, 2_000).await, "the request must start before cancellation");
+        rt.execute_script("abort-fetch", "abortController.abort();").unwrap();
+        let settled = rt.resolve_promises_until(|rt|
+            rt.evaluate("abortOutcome !== null").unwrap() == serde_json::json!(true), 2_000,
+        ).await;
+        let socket_closed = matches!(server.await.unwrap(), Ok(Ok(0)));
+        assert!(settled, "abort must settle without a server response");
+        assert_eq!(rt.evaluate("abortOutcome").unwrap(), serde_json::json!("AbortError"));
+        assert!(socket_closed, "abort must stop native network work, not race a JS promise");
+        assert!(!rt.has_pending_network_requests());
+        assert_eq!(client.in_flight.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let events = rt.take_js_network_events();
+        assert_eq!(events.len(), 1, "one terminal failure, no successful completion");
+        assert_eq!(events[0].status, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_cancels_transport_before_response_headers() {
+        check_fetch_abort_transport(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_abort_cancels_transport_and_body_after_response_headers() {
+        check_fetch_abort_transport(true).await;
+    }
+
     async fn held_fetch_body_runtime() -> (
         ObscuraJsRuntime, tokio::sync::oneshot::Sender<()>,
         tokio::task::JoinHandle<std::io::Result<()>>,
@@ -23019,6 +23331,54 @@ mod tests {
                 "decoderWritable": "function",
             })
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readable_stream_error_discards_queued_chunks_after_close_requested() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const reason = { cancelled: true };
+            const results = [];
+            for (const requestClose of [false, true]) {
+                let controller;
+                const stream = new ReadableStream({start(c) { controller = c; }});
+                controller.enqueue('queued');
+                if (requestClose) controller.close();
+                const reader = stream.getReader();
+                const closed = reader.closed.then(() => false, error => error === reason);
+                controller.error(reason);
+                results.push(await reader.read().then(() => false, error => error === reason));
+                results.push(await closed);
+            }
+            return results;
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([true, true, true, true])));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn readable_stream_closes_only_after_queued_chunks_are_drained() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            let controller;
+            const stream = new ReadableStream({start(c) { controller = c; }});
+            controller.enqueue('first'); controller.enqueue('last'); controller.close();
+            const reader = stream.getReader();
+            let closed = false;
+            const completion = reader.closed.then(() => closed = true);
+            await Promise.resolve();
+            const states = [closed];
+            const first = await reader.read();
+            states.push(closed);
+            const last = await reader.read();
+            await completion;
+            states.push(closed);
+            controller.error('too late');
+            const end = await reader.read();
+            return {states, chunks:[first.value, last.value], done:end.done};
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value, Some(serde_json::json!({
+            "states": [false, false, true], "chunks": ["first", "last"], "done": true,
+        })));
     }
 
     #[tokio::test(flavor = "current_thread")]

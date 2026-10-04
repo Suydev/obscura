@@ -194,6 +194,34 @@ Frames are activity-driven page captures, not fixed-rate desktop video.
 await browser.close();  // closes the CDP connection, leaves obscura serve running
 ```
 
+## Fetch cancellation
+
+Page `fetch()` honors an `AbortSignal` passed directly or inherited from a
+`Request`. Pre-aborted calls reject with the signal's reason without sending a
+request. Aborting an active fetch cancels native transport work, including a
+pending response body, and releases the page's network-readiness counters.
+Cancelled requests report `Network.loadingFailed` rather than a successful
+`Network.loadingFinished`; the Rust network event exposes `error_text` for
+failed requests. Explicit `signal: null` overrides an inherited signal.
+
+Aborting also errors a fully buffered but unread response body. A drained or
+cancelled body stays closed. `Request` and its clones expose distinct following
+signals; dependent signals are marked aborted before the parent's abort event,
+then receive their own events afterward. Cancellation uses internal abort
+algorithms, not overridable public event methods. Dependency links and internal
+body observers use weak references; signals with live abort listeners remain
+reachable.
+
+Cloned intercepted responses follow cancellation even when their bodies are
+already buffered and have no native transport resource. Browser-generated abort
+events are trusted; dispatching an author-created event does not abort a fetch.
+
+Response bodies remain capped, buffered one-chunk bodies. Cancellation does
+not introduce incremental network stream delivery or backpressure support.
+`Response.clone()` currently shares buffered bytes rather than a byte-stream
+tee. Close/error timing can differ when the last chunk is consumed inside an
+early parent abort listener, before dependent abort steps run.
+
 ## Current limits
 
 - `document.queryCommandSupported()` reports editing commands as unsupported.
