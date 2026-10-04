@@ -1229,6 +1229,8 @@ impl ObscuraJsRuntime {
             gs.scroll_generation = 0;
             gs.resolved_scroll = None;
         }
+        drop(gs);
+        self.realm_states().borrow().cancel_inactive_frame_timers();
     }
 
     pub fn set_url(&self, url: &str) {
@@ -8007,6 +8009,109 @@ mod tests {
             result,
             serde_json::json!([true, "{\"ready\":true}", true, 2, true, true, "undefined"])
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn inserting_a_frame_before_itself_retires_its_old_document_without_reordering() {
+        let mut rt = setup_runtime("<html><body><b id='before'></b><iframe id='frame'></iframe><b id='after'></b></body></html>");
+        rt.execute_script("frame-self-insertion", r#"
+            const frame = document.getElementById('frame');
+            const oldWindow = frame.contentWindow;
+            globalThis.oldSignal = oldWindow.AbortSignal.timeout(5);
+            globalThis.oldCalls = 0;
+            oldWindow.setTimeout(() => oldCalls++,5);
+            globalThis.sameNode = document.body.insertBefore(frame,frame) === frame;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("return {aborted:oldSignal.aborted, calls:oldCalls, sameNode, order:Array.from(document.body.children,node=>node.id)};").unwrap(),
+            serde_json::json!({"aborted":false,"calls":0,"sameNode":true,
+                "order":["before","frame","after"]}));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_frame_timers_do_not_run_after_their_document_is_destroyed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("frame-timer-lifetime", r#"
+            const retained = document.createElement('iframe');
+            document.body.appendChild(retained);
+            globalThis.retainedSignal = retained.contentWindow.AbortSignal.timeout(5);
+            globalThis.retainedTimers = 0;
+            retained.contentWindow.setTimeout(() => retainedTimers++,5);
+            globalThis.removedSignals = [];
+            globalThis.removedTimers = Array(8).fill(0);
+            globalThis.freshFrameTimers = [0,0,0];
+            globalThis.freshFrameWindows = [];
+            for (let i=0; i<8; i++) {
+                const container = document.createElement(i===2 ? 'iframe' : 'div');
+                document.body.appendChild(container);
+                const frame = (i===2 ? container.contentDocument : document).createElement('iframe');
+                (i===2 ? container.contentDocument.body : container).appendChild(frame);
+                const oldWindow = frame.contentWindow;
+                removedSignals.push(oldWindow.AbortSignal.timeout(5));
+                oldWindow.setTimeout(() => removedTimers[i]++,5);
+                if (i===0) frame.remove();
+                if (i===1 || i===2) container.remove();
+                if (i===3) container.innerHTML = '<p>replacement</p>';
+                if (i===4) container.textContent = 'replacement';
+                if (i===5) { frame.remove(); container.appendChild(frame); }
+                if (i===6) document.body.appendChild(frame);
+                if (i===7) container.appendChild(frame);
+                if (i>=5) {
+                    freshFrameWindows.push(frame.contentWindow !== oldWindow);
+                    frame.contentWindow.setTimeout(() => freshFrameTimers[i-5]++,5);
+                }
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("return {retainedSignal:retainedSignal.aborted, retainedTimers, \
+            removedSignals:removedSignals.map(signal=>signal.aborted), removedTimers, \
+            freshFrameTimers, freshFrameWindows};").unwrap();
+        assert_eq!(result, serde_json::json!({
+            "retainedSignal":true, "retainedTimers":1,
+            "removedSignals":[false,false,false,false,false,false,false,false],
+            "removedTimers":[0,0,0,0,0,0,0,0],
+            "freshFrameTimers":[1,1,1], "freshFrameWindows":[true,true,true],
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroying_a_child_document_cancels_its_pending_native_sleeps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("frame-pending-timers", r#"
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            globalThis.oldFrame = frame.contentWindow;
+            globalThis.timerCalls = 0;
+            oldFrame.setTimeout(() => timerCalls++,60000);
+            oldFrame.setInterval(() => timerCalls++,60000);
+            frame.remove();
+        "#).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1),rt.run_event_loop())
+            .await.expect("Destroyed frame timers must not keep the native event loop alive")
+            .unwrap();
+        assert_eq!(rt.evaluate("return timerCalls;").unwrap().as_f64(),Some(0.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_frame_teardown_does_not_panic_or_cancel_siblings_when_the_owner_is_borrowed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("frame-owner-contention", r#"
+            globalThis.frameCalls = [0,0];
+            for (let i=0;i<2;i++) {
+                const frame = document.createElement('iframe');
+                document.body.appendChild(frame);
+                frame.contentWindow.setTimeout(() => frameCalls[i]++,5);
+            }
+        "#).unwrap();
+        let pending = rt.take_pending_frames().remove(0);
+        let doomed = crate::frame::FrameRealm::new(&mut rt,pending.frame_id,
+            pending.parent_frame_id,&pending.url,&pending.html).unwrap();
+        let owner = rt.state.clone();
+        let borrowed = owner.borrow_mut();
+        drop(doomed);
+        drop(borrowed);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("return frameCalls;").unwrap(),serde_json::json!([0,1]));
     }
 
     #[test]
