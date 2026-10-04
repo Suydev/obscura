@@ -196,6 +196,10 @@ await browser.close();  // closes the CDP connection, leaves obscura serve runni
 
 ## Current limits
 
+- `document.queryCommandSupported()` reports editing commands as unsupported.
+  `execCommand()` does not perform clipboard or rich-text editing operations.
+  Capability detection allows editor libraries to initialize; it is not full
+  editor interaction support.
 - Playwright `page.video()` and tracing artifacts that require desktop capture
   are not implemented. Use the raw CDP flow above for page frames.
 - `BrowserContext` storage-state save/restore remains limited; use
