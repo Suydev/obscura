@@ -109,6 +109,44 @@ pub(crate) struct CanvasBackingSurface {
     pub pixels: JsBuffer,
 }
 
+const NAVIGATION_TIMING_FIELDS: [&str; 10] = [
+    "navigationStart", "fetchStart", "responseEnd", "domLoading", "domInteractive",
+    "domContentLoadedEventStart", "domContentLoadedEventEnd", "domComplete",
+    "loadEventStart", "loadEventEnd",
+];
+
+/// Observed document milestones, anchored once to the epoch and advanced by
+/// the monotonic clock. Unavailable transport details are not synthesized.
+#[derive(Clone)]
+pub struct NavigationTiming {
+    pub time_origin: f64,
+    origin: std::time::Instant,
+    values: [u64; 10],
+}
+
+impl Default for NavigationTiming {
+    fn default() -> Self {
+        let origin = std::time::Instant::now();
+        let time_origin = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1_000.0;
+        let mut values = [0; 10];
+        values[0] = time_origin as u64;
+        Self { time_origin, origin, values }
+    }
+}
+
+impl NavigationTiming {
+    pub fn record(&mut self, name: &str) {
+        if let Some(index) = NAVIGATION_TIMING_FIELDS.iter().position(|field| *field == name) {
+            // document.open/close and synthetic events must not replace the
+            // first navigation's already-completed milestones.
+            if self.values[index] == 0 {
+                self.values[index] = (self.time_origin + self.origin.elapsed().as_secs_f64() * 1_000.0) as u64;
+            }
+        }
+    }
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -124,6 +162,7 @@ pub struct ObscuraState {
     /// browser/API navigations leave this empty; document-initiated
     /// navigations set it to the source document URL.
     pub referrer: String,
+    pub navigation_timing: NavigationTiming,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
@@ -384,6 +423,7 @@ impl ObscuraState {
             encoding: "UTF-8".to_string(),
             title: String::new(),
             referrer: String::new(),
+            navigation_timing: NavigationTiming::default(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
@@ -1668,6 +1708,24 @@ fn op_dom(
 }
 
 fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) -> String {
+    if cmd == "performance_time_origin" {
+        return shared.borrow().navigation_timing.time_origin.to_string();
+    }
+    if cmd == "performance_timing" {
+        let state = shared.borrow();
+        let timing = &state.navigation_timing;
+        if arg1.is_empty() {
+            let values: serde_json::Map<String, serde_json::Value> = NAVIGATION_TIMING_FIELDS
+                .iter().zip(timing.values).map(|(name, value)| (name.to_string(), value.into())).collect();
+            return serde_json::Value::Object(values).to_string();
+        }
+        return NAVIGATION_TIMING_FIELDS.iter().position(|field| *field == arg1)
+            .map(|index| timing.values[index].to_string()).unwrap_or_else(|| "null".into());
+    }
+    if cmd == "performance_lifecycle" {
+        shared.borrow_mut().navigation_timing.record(&arg1);
+        return "null".into();
+    }
     if cmd == "document_lifecycle" {
         let mut state = shared.borrow_mut();
         // Page lifecycle collection is independent of Runtime.enable.
@@ -2699,6 +2757,68 @@ fn op_runtime_events_enabled(state: &OpState) -> bool {
         .borrow::<SharedState>()
         .borrow()
         .runtime_events_enabled
+}
+
+pub(crate) fn record_uncaught_exception(
+    state: &mut ObscuraState,
+    error: &deno_core::error::JsError,
+    fallback_url: &str,
+) {
+    if !state.runtime_events_enabled {
+        return;
+    }
+    state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+    let first = error.frames.first();
+    let url = first
+        .and_then(|frame| frame.file_name.clone())
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| fallback_url.to_string());
+    let line_number = first.and_then(|frame| frame.line_number).unwrap_or(1).saturating_sub(1);
+    let column_number = first.and_then(|frame| frame.column_number).unwrap_or(1).saturating_sub(1);
+    let stack_trace = error.frames.iter().map(|frame| {
+        serde_json::json!({
+            "functionName": frame.function_name.as_deref().unwrap_or(""),
+            "scriptId": "",
+            "url": frame.file_name.as_deref().unwrap_or(fallback_url),
+            "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+            "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+        })
+    }).collect();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64() * 1_000.0;
+    if state.pending_runtime_events.len() >= 1_024 {
+        state.pending_runtime_events.pop_front();
+    }
+    state.pending_runtime_events.push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
+        exception_id: state.runtime_exception_counter,
+        name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
+        description: error.stack.clone().unwrap_or_else(|| error.exception_message.clone()),
+        url,
+        line_number,
+        column_number,
+        stack_trace,
+        timestamp,
+    }));
+}
+
+#[op2(nofast)]
+fn op_report_browser_exception<'s, 'i>(
+    scope: &mut v8::PinScope<'s, 'i>,
+    state: &OpState,
+    error: v8::Local<'s, v8::Value>,
+    frame_id: u32,
+) {
+    let Some(owner) = posted_task_owner(state, frame_id) else { return; };
+    let Ok(page) = owner.try_borrow() else { return; };
+    if !page.runtime_events_enabled { return; }
+    let url = page.url.clone();
+    drop(page);
+    let error = deno_core::error::JsError::from_v8_exception(scope, error);
+    if let Ok(mut page) = owner.try_borrow_mut() {
+        record_uncaught_exception(&mut page, &error, &url);
+    };
 }
 
 #[op2(fast)]
@@ -6465,6 +6585,7 @@ pub fn build_extension() -> Extension {
         op_cssom_stylesheet_clear(),
         op_runtime_events_enabled(),
         op_console_msg(),
+        op_report_browser_exception(),
         op_fetch_url(),
         op_fetch_body(),
         op_get_cookies(),
@@ -6850,7 +6971,7 @@ fn ensure_prepared_render_with_base_url(
                         animation_sample,
                         &mut state.animation_timeline,
                     )?,
-                    obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                    _ => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
                         dom,
                         viewport,
                         base_url.as_deref(),

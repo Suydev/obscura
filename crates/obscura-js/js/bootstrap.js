@@ -32,6 +32,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
+    '__obscura_inputChecked', '__obscura_setInputChecked',
+    '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts', '__obscura_hasPendingParserBlockingScripts',
     '__obscura_nextPendingTimeoutDelay',
@@ -792,6 +794,32 @@ function _loadFormState(nid) {
   }
   _formStateLoaded.add(nid);
 }
+
+// Native activation changes checkedness without invoking author-defined IDL
+// accessors. Frameworks may wrap those accessors to track script assignments.
+function _inputChecked(el) {
+  if (_formChecked[el._nid] === undefined) _loadFormState(el._nid);
+  if (_formChecked[el._nid] !== undefined) return _formChecked[el._nid];
+  return el.hasAttribute("checked");
+}
+function _setInputChecked(el, value) {
+  const checked = !!value;
+  _formChecked[el._nid] = checked;
+  _dom("set_form_checked", el._nid, String(checked));
+}
+function _inputIndeterminate(el) {
+  if (_formIndeterminate[el._nid] === undefined) _loadFormState(el._nid);
+  return _formIndeterminate[el._nid] === true;
+}
+function _setInputIndeterminate(el, value) {
+  const indeterminate = !!value;
+  _formIndeterminate[el._nid] = indeterminate;
+  _dom("set_form_indeterminate", el._nid, String(indeterminate));
+}
+globalThis.__obscura_inputChecked = _inputChecked;
+globalThis.__obscura_setInputChecked = _setInputChecked;
+globalThis.__obscura_inputIndeterminate = _inputIndeterminate;
+globalThis.__obscura_setInputIndeterminate = _setInputIndeterminate;
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -1785,14 +1813,33 @@ class CSSStyleDeclaration {
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  // CSSOM: the style attribute is only rewritten when the declaration
+  // changed. Rewriting it on a no-op set queued a mutation record, so a
+  // MutationObserver that re-applies the same style re-triggered itself
+  // forever (a page pinning body `top: 0` spun at 100% CPU).
   setProperty(name, value) {
     this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
+    const old = this._props[k];
+    if (value === "" || value == null) {
+      if (old === undefined) return;
+      delete this._props[k];
+    } else {
+      value = String(value);
+      if (old === value) return;
+      this._props[k] = value;
+    }
     this._push();
   }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  removeProperty(name) {
+    this._pull();
+    const k = _cssCamelToKebab(String(name));
+    const old = this._props[k];
+    if (old === undefined) return "";
+    delete this._props[k];
+    this._push();
+    return old;
+  }
   getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() { this._pull(); return _serializeCss(this._props); }
@@ -1879,6 +1926,7 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+const _eventTargetListenerChanged = new WeakMap();
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1910,6 +1958,7 @@ function _eventTargetAdd(target, type, callback, options) {
     abortHandler: null,
   };
   listeners.push(entry);
+  _eventTargetListenerChanged.get(target)?.();
   if (signal && typeof signal.addEventListener === "function") {
     entry.abortHandler = () => _eventTargetRemove(target, type, callback, capture);
     signal.addEventListener("abort", entry.abortHandler, { once: true });
@@ -1933,6 +1982,7 @@ function _eventTargetRemove(target, type, callback, options) {
   }
   if (listeners.length === 0) byType.delete(type);
   if (byType.size === 0) _eventTargetListeners.delete(target);
+  _eventTargetListenerChanged.get(target)?.();
 }
 function _eventTargetDispatch(target, event) {
   if (!event || typeof event.type === "undefined") {
@@ -3071,7 +3121,9 @@ globalThis.__obscura_interactiveHost = function(el) {
 // Frozen so page script can neither replace the helpers to suppress or fake
 // label activation, nor delete them and make later clicks throw.
 for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
-                     '__obscura_labeledControl', '__obscura_interactiveHost']) {
+                     '__obscura_labeledControl', '__obscura_interactiveHost',
+                     '__obscura_inputChecked', '__obscura_setInputChecked',
+                     '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate']) {
   Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
 }
 
@@ -4003,6 +4055,12 @@ class Element extends Node {
     // private token so the forwarded events stay trusted. Read from arguments
     // to keep click.length at 0, as in a real browser.
     const _trusted = arguments[0] === _TRUSTED_ACTIVATION;
+    // A borrowed method must activate in the receiver's realm: node ids and
+    // private checkedness are local to each document.
+    if (_cache.get(this._nid) !== this) {
+      const activate = _documentRealmMember(this, 'activateElement');
+      if (activate) return activate.call(this, _trusted);
+    }
     // Pre-click activation steps (HTML spec): a checkbox/radio flips BEFORE the
     // click event dispatches, so listeners observe the new state, and the change
     // is reverted if the event is cancelled. This mirrors the CDP mouse path in
@@ -4019,8 +4077,8 @@ class Element extends Node {
     }
     let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
-      _oldChecked = !!this.checked;
-      _oldIndeterminate = !!this.indeterminate;
+      _oldChecked = _inputChecked(this);
+      _oldIndeterminate = _inputIndeterminate(this);
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -4030,29 +4088,29 @@ class Element extends Node {
             const r = _all[i];
             if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
             if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
-            _radioStates.push([r, !!r.checked]);
-            if (r !== this) r.checked = false;
+            _radioStates.push([r, _inputChecked(r)]);
+            if (r !== this) _setInputChecked(r, false);
           }
         }
-        this.checked = true;
+        _setInputChecked(this, true);
       } else {
         // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
         // checkedness *and* drops indeterminateness. Clearing it here, not on
         // `change`, is what lets the cancelled-activation path put the old
         // flag back instead of leaving it stuck off.
-        this.checked = !_oldChecked;
-        this.indeterminate = false;
+        _setInputChecked(this, !_oldChecked);
+        _setInputIndeterminate(this, false);
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
-      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
+      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _setInputChecked(_radioStates[i][0], _radioStates[i][1]); }
+      else if (_checkable) { _setInputChecked(this, _oldChecked); _setInputIndeterminate(this, _oldIndeterminate); }
       return;
     }
-    if (_checkable && this.checked !== _oldChecked) {
+    if (_checkable && _inputChecked(this) !== _oldChecked) {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
         if (_trusted) globalThis.__obscura_markTrusted(_e);
@@ -4411,27 +4469,20 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    if (_formChecked[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
-    return this.hasAttribute("checked");
+    return _inputChecked(this);
   }
   set checked(v) {
-    const checked = !!v;
-    _formChecked[this._nid] = checked;
-    _dom("set_form_checked", this._nid, String(checked));
+    _setInputChecked(this, v);
   }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so
   // the property itself must exist on the prototype for `'indeterminate' in
   // el` to be true on a freshly created element. Native node-keyed state
   // keeps IDL access and rendering consistent without changing attributes.
   get indeterminate() {
-    if (_formIndeterminate[this._nid] === undefined) _loadFormState(this._nid);
-    return _formIndeterminate[this._nid] === true;
+    return _inputIndeterminate(this);
   }
   set indeterminate(v) {
-    const indeterminate = !!v;
-    _formIndeterminate[this._nid] = indeterminate;
-    _dom("set_form_indeterminate", this._nid, String(indeterminate));
+    _setInputIndeterminate(this, v);
   }
   get selected() {
     if (this._selected !== undefined) return this._selected;
@@ -4915,6 +4966,10 @@ class Element extends Node {
   }
   get offsetParent() {
     if (!this.isConnected || this._renderBoxGeometry() === null) return null;
+    // CSSOM View: null for the root element and the body element. Returning
+    // document.body here made body.offsetParent === body, so the common
+    // `while (el) { x += el.offsetLeft; el = el.offsetParent; }` never ended.
+    if (this === document.documentElement || this === document.body) return null;
     const ownStyle = globalThis.getComputedStyle(this);
     if (ownStyle.position === 'fixed') return null;
 
@@ -6323,16 +6378,22 @@ class Document extends Node {
       // document.write's parser-blocking queue may still be fetching a
       // classic script. It must finish before DOMContentLoaded is observable.
       if (__parserBlockingScriptPending > 0) { setTimeout(finishParsing, 1); return; }
+      _dom('performance_lifecycle', 'domInteractive');
       globalThis.__documentReadyState__ = 'interactive';
       this.dispatchEvent(new Event('readystatechange'));
+      _dom('performance_lifecycle', 'domContentLoadedEventStart');
       this.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true }));
+      _dom('performance_lifecycle', 'domContentLoadedEventEnd');
       _dom('document_lifecycle', 'DOMContentLoaded');
       const complete = () => {
         if (generation !== this._writeGeneration) return;
         if (__dynLoadDelayingPending > 0) { setTimeout(complete, 1); return; }
+        _dom('performance_lifecycle', 'domComplete');
         globalThis.__documentReadyState__ = 'complete';
         this.dispatchEvent(new Event('readystatechange'));
+        _dom('performance_lifecycle', 'loadEventStart');
         globalThis.dispatchEvent(new Event('load'));
+        _dom('performance_lifecycle', 'loadEventEnd');
         _dom('document_lifecycle', 'load');
       };
       complete();
@@ -7783,7 +7844,7 @@ globalThis.fetch = async (input, init = {}) => {
   const responseBody = respType === "opaque"
     ? null
     : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
-  const response = new Response(responseBody, {
+  const response = _createInternalResponse(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
@@ -8236,13 +8297,36 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
+let _createInternalResponse;
 if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status === undefined ? 200 : Number(init.status); this.statusText = init.statusText || '';
+  const internalResponseInit = {};
+  const _Response = globalThis.Response = class Response {
+    constructor(body, init = {}, internalInit) {
+      if (init == null) init = {};
+      if (typeof init !== 'object' && typeof init !== 'function') {
+        throw new TypeError('Response init must be a dictionary');
+      }
+      const internal = internalInit === internalResponseInit;
+      const headers = init.headers;
+      const status = init.status;
+      const statusText = init.statusText;
+      this.status = status === undefined ? 200 : (internal ? status : (+status & 0xffff));
+      this.statusText = statusText === undefined ? '' : `${statusText}`;
+      if (!internal) {
+        if (this.status < 200 || this.status > 599) throw new RangeError('Invalid response status');
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError('Invalid response statusText');
+        if (body != null && (this.status === 204 || this.status === 205 || this.status === 304)) {
+          throw new TypeError('Response status cannot have a body');
+        }
+      } else if (this.status === 204 || this.status === 205 || this.status === 304) {
+        body = null;
+      }
+      this._bodyBytes = _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      this.headers = new Headers(headers);
+      this.type = internal ? (init.type || 'default') : 'default';
+      this.url = internal ? (init.url || '') : '';
+      this.redirected = internal && !!init.redirected;
       // #818: body/bodyUsed. A null-body response (null or no body passed)
       // has body === null; every other body is a one-chunk stream, created
       // lazily so merely touching .body does not copy the bytes.
@@ -8298,7 +8382,7 @@ if (typeof Response === 'undefined') {
     async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
     async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
     clone() {
-      const copy = new Response(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+      const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {
         const promise = this._fetchBody.promise.then(bytes => bytes.slice());
         promise.catch(() => {});
@@ -8307,10 +8391,25 @@ if (typeof Response === 'undefined') {
       }
       return copy;
     }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
+    static error() { return _createInternalResponse(null, { status: 0, type: 'error' }); }
+    static redirect(url, status = 302) {
+      url = `${url}`;
+      status = +status & 0xffff;
+      const parsed = new URL(url, document.baseURI);
+      if (![301,302,303,307,308].includes(status)) throw new RangeError('Invalid redirect status');
+      return new Response(null, { status, headers: { Location: parsed.href } });
+    }
+    static json(data, init) {
+      const json = JSON.stringify(data);
+      if (json === undefined) throw new TypeError('Value is not JSON serializable');
+      const response = new Response(new TextEncoder().encode(json), init);
+      if (!response.headers.has('content-type')) response.headers.set('content-type', 'application/json');
+      return response;
+    }
   };
+  _createInternalResponse = (body, init) => new _Response(body, init, internalResponseInit);
+} else {
+  _createInternalResponse = (body, init) => new Response(body, init);
 }
 
 if (!Element.prototype.replaceWith) {
@@ -8885,7 +8984,7 @@ function _evaluateMediaFeature(raw) {
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
   if (match) return match[1] === 'light';
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
-  if (match) return match[1] === 'no-preference';
+  if (match) return match[1] === (globalThis.__obscura_reduced_motion ? 'reduce' : 'no-preference');
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
@@ -8940,17 +9039,31 @@ function _evaluateMediaQueryList(query) {
 
 globalThis.matchMedia = _markNative(function matchMedia(q) {
   const media = q == null ? '' : String(q);
-  return {
-    get matches() { return _evaluateMediaQueryList(media); },
-    media,
-    onchange: null,
-    addListener(){},
-    removeListener(){},
-    addEventListener(){},
-    removeEventListener(){},
-    dispatchEvent(){return true;}
-  };
+  return new MediaQueryList(_mediaQueryToken, media);
 });
+const _mediaQueryToken = {};
+const _mediaQueries = new Set();
+// A document keeps query lists with change listeners alive even when author
+// code does not retain the object returned from matchMedia().
+const _activeMediaQueries = new Set();
+const _mediaQueryState = new WeakMap();
+globalThis.__obscura_recompute_media_queries = () => {
+  // Media/viewport changes also invalidate live computed-style snapshots.
+  // Keep the epoch in this private scope, not in host-injected page script.
+  _domMutationEpoch++;
+  for (const ref of _mediaQueries) {
+    const query = ref.deref();
+    if (!query) { _mediaQueries.delete(ref); continue; }
+    const state = _mediaQueryState.get(query);
+    const matches = query.matches;
+    if (matches === state.matches) continue;
+    state.matches = matches;
+    // Capture the value at this rendering change, not at eventual delivery.
+    setTimeout(() => query.dispatchEvent(new MediaQueryListEvent('change', {
+      matches, media: query.media,
+    })), 0);
+  }
+};
 // getComputedStyle() returns a fresh declaration object, but those objects all
 // observe the same computed style until the document or viewport changes.
 // Share the immutable native snapshot behind them. Frameworks routinely call
@@ -10441,12 +10554,6 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   else Promise.resolve().then(wireUp);
 })();
 globalThis.IntersectionObserverEntry = class IntersectionObserverEntry {};
-globalThis.PerformanceObserver = class { constructor(){} observe(){} disconnect(){} };
-// Feature detection reads this static before deciding to observe anything;
-// absent it, supportedEntryTypes.includes(...) throws and instrumentation
-// bails. Report only types the engine can actually emit records for.
-PerformanceObserver.supportedEntryTypes = ["mark", "measure", "navigation", "resource", "paint"];
-_markNative(PerformanceObserver);
 
 globalThis.DOMException = (function () {
   const NAME_TO_CODE = {
@@ -10649,6 +10756,19 @@ globalThis.KeyboardEvent = class extends Event {
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
+const _browserErrorEvent = globalThis.ErrorEvent;
+__obscuraCore.setReportExceptionCallback(error => {
+  // deno_core's default reporter terminates execution, discarding the rest of
+  // the microtask checkpoint. Browser callback errors must leave queued work live.
+  let message;
+  try { message = String(error?.message ?? error); }
+  catch (_) { message = "Uncaught exception"; }
+  const event = new _browserErrorEvent("error", { message, error, cancelable: true });
+  if (_eventTargetDispatch(globalThis, event)) {
+    __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
+    _consoleFn("error", [error]);
+  }
+});
 globalThis.PointerEvent = class extends MouseEvent {
   constructor(t,o={}) {
     super(t,o);
@@ -11359,9 +11479,7 @@ globalThis.performance = globalThis.performance || {
       return _last;
     };
   })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
+  clearResourceTimings(){},
   setResourceTimingBufferSize(){},
   timeOrigin: 0,
   timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
@@ -11372,6 +11490,289 @@ globalThis.performance = globalThis.performance || {
     usedJSHeapSize: 16781520,
   },
 };
+
+// User Timing entries belong to this realm. The registry gives marks/measures
+// an unlimited timeline: retain them until clearMarks/clearMeasures or teardown,
+// not an arbitrary cap that silently invalidates long-running measurements.
+(function() {
+  const perf = globalThis.performance;
+  globalThis.Performance = class Performance {
+    constructor() { throw new TypeError('Illegal constructor'); }
+  };
+  Object.setPrototypeOf(perf, Performance.prototype);
+  const buffers = Object.assign(Object.create(null), {mark: [], measure: []});
+  const latestMarks = new Map();
+  const entryState = new WeakMap();
+  const observerState = new WeakMap();
+  const listState = new WeakMap();
+  const observers = new Set();
+  const entryKey = {};
+  const supported = Object.freeze(['mark', 'measure']);
+  const timingNames = new Set([
+    'navigationStart', 'unloadEventStart', 'unloadEventEnd', 'redirectStart', 'redirectEnd',
+    'fetchStart', 'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+    'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd', 'domLoading',
+    'domInteractive', 'domContentLoadedEventStart', 'domContentLoadedEventEnd',
+    'domComplete', 'loadEventStart', 'loadEventEnd',
+  ]);
+  let deliveryPending = false;
+  function state(map, receiver) {
+    const value = map.get(receiver);
+    if (!value) throw new TypeError('Illegal invocation');
+    return value;
+  }
+  function string(value) {
+    if (typeof value === 'symbol') throw new TypeError('Cannot convert a Symbol to a string');
+    return String(value);
+  }
+  function dictionary(value) {
+    if (value == null) return {};
+    if (typeof value !== 'object' && typeof value !== 'function') throw new TypeError('Expected a dictionary');
+    return value;
+  }
+  function number(value) {
+    const result = +value;
+    if (!Number.isFinite(result)) throw new TypeError('Timestamp must be finite');
+    return result;
+  }
+  function timestamp(value) {
+    if (typeof value === 'number') {
+      value = number(value);
+      if (value < 0) throw new TypeError('Timestamp must not be negative');
+      return value;
+    }
+    value = string(value);
+    if (timingNames.has(value)) {
+      if (value === 'navigationStart') return 0;
+      const time = perf.timing[value] || 0;
+      if (!time) throw new DOMException('Timing event has not occurred', 'InvalidAccessError');
+      return time - perf.timing.navigationStart;
+    }
+    const mark = latestMarks.get(value);
+    if (!mark) throw new DOMException('The mark does not exist: ' + value, 'SyntaxError');
+    return entryState.get(mark).startTime;
+  }
+  function entries(buffer, name, type) {
+    return buffer.filter(entry => {
+      const data = entryState.get(entry);
+      return (name === undefined || data.name === name) && (type === undefined || data.entryType === type);
+    }).sort((a, b) => entryState.get(a).startTime - entryState.get(b).startTime);
+  }
+  function allEntries() { return buffers.mark.concat(buffers.measure); }
+  function checkPerformance(receiver) {
+    if (receiver !== perf) throw new TypeError('Illegal invocation');
+  }
+  globalThis.PerformanceEntry = class PerformanceEntry {
+    constructor(key) { if (key !== entryKey) throw new TypeError('Illegal constructor'); }
+    get name() { return state(entryState, this).name; }
+    get entryType() { return state(entryState, this).entryType; }
+    get startTime() { return state(entryState, this).startTime; }
+    get duration() { return state(entryState, this).duration; }
+    toJSON() {
+      const data = state(entryState, this);
+      return {name: data.name, entryType: data.entryType, startTime: data.startTime, duration: data.duration, detail: data.detail};
+    }
+  };
+  globalThis.PerformanceMark = class PerformanceMark extends PerformanceEntry {
+    constructor(name, options = {}) {
+      super(entryKey);
+      if (!arguments.length) throw new TypeError('A mark name is required');
+      name = string(name);
+      options = dictionary(options);
+      const detail = options.detail;
+      const start = options.startTime;
+      const startTime = start === undefined ? perf.now() : number(start);
+      if (timingNames.has(name)) throw new DOMException('Reserved timing name: ' + name, 'SyntaxError');
+      if (startTime < 0) throw new TypeError('Timestamp must not be negative');
+      entryState.set(this, {name, entryType: 'mark', startTime, duration: 0,
+        detail: detail === undefined ? null : _structuredClone(detail, new Map())});
+    }
+    get detail() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'mark') throw new TypeError('Illegal invocation');
+      return data.detail;
+    }
+  };
+  globalThis.PerformanceMeasure = class PerformanceMeasure extends PerformanceEntry {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get detail() {
+      const data = state(entryState, this);
+      if (data.entryType !== 'measure') throw new TypeError('Illegal invocation');
+      return data.detail;
+    }
+  };
+  function queueDelivery() {
+    if (deliveryPending) return;
+    deliveryPending = true;
+    // Reuse browser posted tasks: asynchronous delivery without a timer-wheel
+    // delay or polling, cancelled at the document-generation boundary.
+    _browserPostedTaskEnqueue(() => {
+      deliveryPending = false;
+      for (const observer of Array.from(observers)) {
+        const data = observerState.get(observer);
+        if (!data.records.length) continue;
+        const list = Object.create(PerformanceObserverEntryList.prototype);
+        listState.set(list, data.records);
+        data.records = [];
+        const options = data.requiresDroppedEntries ? {droppedEntriesCount: 0} : {};
+        data.requiresDroppedEntries = false;
+        try { data.callback.call(observer, list, observer, options); }
+        catch (error) { globalThis.reportError(error); }
+      }
+    }, 0, _browserPostedTaskGeneration(), () => {
+      deliveryPending = false;
+      for (const observer of observers) observerState.get(observer).records = [];
+    });
+  }
+  function record(entry) {
+    const data = entryState.get(entry);
+    buffers[data.entryType].push(entry);
+    if (data.entryType === 'mark') {
+      const previous = latestMarks.get(data.name);
+      if (!previous || entryState.get(previous).startTime <= data.startTime) latestMarks.set(data.name, entry);
+    }
+    let notify = false;
+    for (const observer of observers) {
+      const observerData = observerState.get(observer);
+      if (observerData.types.has(data.entryType)) { observerData.records.push(entry); notify = true; }
+    }
+    if (notify) queueDelivery();
+    return entry;
+  }
+  perf.mark = function mark(name, options = {}) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A mark name is required');
+    return record(new PerformanceMark(name, options));
+  };
+  perf.measure = function measure(name, startOrOptions = {}, endMark) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('A measure name is required');
+    name = string(name);
+    const isOptions = startOrOptions == null || typeof startOrOptions === 'object' || typeof startOrOptions === 'function';
+    let start, end, duration, detail;
+    if (isOptions) {
+      const options = dictionary(startOrOptions);
+      detail = options.detail;
+      const rawDuration = options.duration;
+      duration = rawDuration === undefined ? undefined : number(rawDuration);
+      end = options.end;
+      if (typeof end === 'number') end = number(end);
+      else if (end !== undefined) end = string(end);
+      start = options.start;
+      if (typeof start === 'number') start = number(start);
+      else if (start !== undefined) start = string(start);
+      if (start !== undefined || end !== undefined || duration !== undefined || detail !== undefined) {
+        if (endMark !== undefined || (start === undefined && end === undefined) ||
+            (start !== undefined && end !== undefined && duration !== undefined)) throw new TypeError('Invalid measure options');
+      }
+    } else start = string(startOrOptions);
+    if (endMark !== undefined) end = string(endMark);
+    const endTime = end !== undefined ? timestamp(end) :
+      start !== undefined && duration !== undefined ? timestamp(start) + timestamp(duration) : perf.now();
+    const startTime = start !== undefined ? timestamp(start) :
+      duration !== undefined && end !== undefined ? timestamp(end) - timestamp(duration) : 0;
+    const entry = Object.create(PerformanceMeasure.prototype);
+    entryState.set(entry, {name, entryType: 'measure', startTime, duration: endTime - startTime,
+      detail: detail === undefined ? null : _structuredClone(detail, new Map())});
+    return record(entry);
+  };
+  function clear(type, name) {
+    name = name === undefined ? undefined : string(name);
+    buffers[type] = name === undefined ? [] : buffers[type].filter(entry => entryState.get(entry).name !== name);
+    if (type === 'mark') {
+      if (name === undefined) latestMarks.clear();
+      else latestMarks.delete(name);
+    }
+  }
+  perf.clearMarks = function clearMarks(name = undefined) { checkPerformance(this); clear('mark', name); };
+  perf.clearMeasures = function clearMeasures(name = undefined) { checkPerformance(this); clear('measure', name); };
+  perf.getEntries = function getEntries() { checkPerformance(this); return entries(allEntries()); };
+  perf.getEntriesByType = function getEntriesByType(type) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('An entry type is required');
+    type = string(type);
+    return entries(buffers[type] || []);
+  };
+  perf.getEntriesByName = function getEntriesByName(name, type = undefined) {
+    checkPerformance(this);
+    if (!arguments.length) throw new TypeError('An entry name is required');
+    return entries(allEntries(), string(name), type === undefined ? undefined : string(type));
+  };
+  globalThis.PerformanceObserverEntryList = class PerformanceObserverEntryList {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    getEntries() { return entries(state(listState, this)); }
+    getEntriesByType(type) {
+      const buffer = state(listState, this);
+      if (!arguments.length) throw new TypeError('An entry type is required');
+      return entries(buffer, undefined, string(type));
+    }
+    getEntriesByName(name, type = undefined) {
+      const buffer = state(listState, this);
+      if (!arguments.length) throw new TypeError('An entry name is required');
+      return entries(buffer, string(name), type === undefined ? undefined : string(type));
+    }
+  };
+  globalThis.PerformanceObserver = class PerformanceObserver {
+    constructor(callback) {
+      if (typeof callback !== 'function') throw new TypeError('An observer callback is required');
+      observerState.set(this, {callback, records: [], types: new Set(), mode: undefined, requiresDroppedEntries: false});
+    }
+    observe(options = {}) {
+      const data = state(observerState, this);
+      options = dictionary(options);
+      const buffered = options.buffered;
+      const entryTypes = options.entryTypes;
+      const rawType = options.type;
+      const type = rawType === undefined ? undefined : string(rawType);
+      if (entryTypes === undefined && type === undefined) throw new TypeError('An entry type is required');
+      if (entryTypes !== undefined && (type !== undefined || buffered !== undefined)) throw new TypeError('Invalid observer options');
+      let types;
+      if (entryTypes !== undefined) {
+        if (entryTypes == null || (typeof entryTypes !== 'object' && typeof entryTypes !== 'function')) throw new TypeError('Expected a sequence');
+        if (typeof entryTypes[Symbol.iterator] !== 'function') throw new TypeError('Expected a sequence');
+        types = Array.from(entryTypes, string);
+      } else types = [type];
+      const mode = entryTypes === undefined ? 'single' : 'multiple';
+      if (data.mode !== undefined && data.mode !== mode) throw new DOMException('Cannot change observer mode', 'InvalidModificationError');
+      data.mode = mode;
+      data.requiresDroppedEntries = true;
+      types = types.filter(value => supported.includes(value));
+      if (!types.length) return;
+      if (mode === 'multiple') data.types = new Set(types);
+      else data.types.add(type);
+      observers.add(this);
+      if (buffered) {
+        for (const entry of buffers[type]) data.records.push(entry);
+        if (data.records.length) queueDelivery();
+      }
+    }
+    disconnect() {
+      const data = state(observerState, this);
+      observers.delete(this);
+      data.records = [];
+      data.types.clear();
+    }
+    takeRecords() {
+      const data = state(observerState, this);
+      const records = data.records;
+      data.records = [];
+      return records;
+    }
+    static get supportedEntryTypes() { return supported; }
+  };
+  for (const name of ['mark', 'measure', 'clearMarks', 'clearMeasures', 'getEntries', 'getEntriesByType', 'getEntriesByName']) {
+    Object.defineProperty(Performance.prototype, name, Object.getOwnPropertyDescriptor(perf, name));
+    delete perf[name];
+  }
+  for (const name of ['Performance', 'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserverEntryList', 'PerformanceObserver']) {
+    Object.defineProperty(globalThis, name, {enumerable: false});
+    const proto = globalThis[name].prototype;
+    Object.defineProperty(proto, Symbol.toStringTag, {value: name, configurable: true});
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key !== 'constructor') Object.defineProperty(proto, key, {...Object.getOwnPropertyDescriptor(proto, key), enumerable: true});
+    }
+  }
+})();
 
 var _commonFonts = [
   'Arial', 'Arial Black', 'Arial Narrow',
@@ -15882,12 +16283,49 @@ if (typeof BroadcastChannel === 'undefined') {
   Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
 }
 
-if (typeof MediaQueryList === 'undefined') {
-  globalThis.MediaQueryList = class MediaQueryList {
-    constructor(q) { this.media = q || ''; this.matches = false; }
-    addListener() {} removeListener() {} addEventListener() {} removeEventListener() {}
-  };
-}
+globalThis.MediaQueryListEvent = class MediaQueryListEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    Object.defineProperties(this, {
+      matches: { value: !!init.matches, enumerable: true },
+      media: { value: String(init.media ?? ''), enumerable: true },
+    });
+  }
+};
+globalThis.MediaQueryList = class MediaQueryList {
+  constructor(token, media) {
+    if (token !== _mediaQueryToken) throw new TypeError('Illegal constructor');
+    _mediaQueryState.set(this, { media, matches: _evaluateMediaQueryList(media), onchange: null });
+    _mediaQueries.add(new WeakRef(this));
+    _eventTargetListenerChanged.set(this, () => {
+      if (_eventTargetListeners.get(this)?.get('change')?.length) _activeMediaQueries.add(this);
+      else _activeMediaQueries.delete(this);
+    });
+  }
+  get media() { return _mediaQueryState.get(this).media; }
+  get matches() { return _evaluateMediaQueryList(this.media); }
+  get onchange() { return _mediaQueryState.get(this).onchange; }
+  set onchange(value) {
+    const state = _mediaQueryState.get(this);
+    state.onchange = typeof value === 'function' ? value : null;
+    // The event-handler slot is independent of an explicitly registered
+    // callback, and replacing its value preserves its position in the list.
+    if (state.onchange && !state.onchangeListener) {
+      state.onchangeListener = event => state.onchange?.call(this, event);
+      this.addEventListener('change', state.onchangeListener);
+    } else if (!state.onchange && state.onchangeListener) {
+      this.removeEventListener('change', state.onchangeListener);
+      state.onchangeListener = null;
+    }
+  }
+  addListener(callback) { this.addEventListener('change', callback); }
+  removeListener(callback) { this.removeEventListener('change', callback); }
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  get [Symbol.toStringTag]() { return 'MediaQueryList'; }
+};
+Object.setPrototypeOf(MediaQueryList.prototype, EventTarget.prototype);
 
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
@@ -16417,12 +16855,17 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
-// Capture late-defined document members too, before page code can replace them.
-const _documentMembers = Object.freeze(Object.fromEntries(
-  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+// Capture late-defined members too, before page code can replace them.
+const _nativeElementClick = Element.prototype.click;
+const _documentMembers = Object.freeze(Object.fromEntries([
+  ...['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
-  })));
+  }),
+  ['activateElement', function(trusted) {
+    return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
+  }],
+]));
 
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
@@ -16475,11 +16918,18 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  // A navigation start precedes the wall clock, so skew into the past only: an
-  // origin ahead of it makes performance.now() and the rAF timestamp negative.
-  const t0 = Date.now() - 1 - Math.floor(_fpRand(641) * 100);
-  globalThis.performance.timeOrigin = t0;
-  globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
+  const timing = {};
+  for (const name of Object.keys(JSON.parse(_dom('performance_timing')))) {
+    Object.defineProperty(timing, name, {
+      enumerable: true, get() { return +_dom('performance_timing', name); },
+    });
+  }
+  Object.defineProperty(globalThis.performance, 'timeOrigin', {
+    configurable: true, value: +_dom('performance_time_origin'), writable: false,
+  });
+  Object.defineProperty(globalThis.performance, 'timing', {
+    configurable: true, value: timing, writable: false,
+  });
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
   globalThis.performance.memory = {
     jsHeapSizeLimit: 4294705152,

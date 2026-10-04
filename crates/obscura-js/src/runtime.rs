@@ -20,7 +20,7 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    ObscuraState, RuntimeEvent, RuntimeExceptionEvent, StoredNetworkResponseBody,
+    ObscuraState, RuntimeEvent, StoredNetworkResponseBody,
     begin_animation_task, build_extension, node_is_script,
 };
 #[cfg(feature = "render")]
@@ -1347,61 +1347,7 @@ impl ObscuraJsRuntime {
     }
 
     fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
-        let mut state = self.state.borrow_mut();
-        if !state.runtime_events_enabled {
-            return;
-        }
-        state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
-        let first = error.frames.first();
-        let url = first
-            .and_then(|frame| frame.file_name.clone())
-            .filter(|url| !url.is_empty())
-            .unwrap_or_else(|| fallback_url.to_string());
-        let line_number = first
-            .and_then(|frame| frame.line_number)
-            .unwrap_or(1)
-            .saturating_sub(1);
-        let column_number = first
-            .and_then(|frame| frame.column_number)
-            .unwrap_or(1)
-            .saturating_sub(1);
-        let stack_trace = error
-            .frames
-            .iter()
-            .map(|frame| {
-                serde_json::json!({
-                    "functionName": frame.function_name.as_deref().unwrap_or(""),
-                    "scriptId": "",
-                    "url": frame.file_name.as_deref().unwrap_or(fallback_url),
-                    "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
-                    "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
-                })
-            })
-            .collect();
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1_000.0;
-        if state.pending_runtime_events.len() >= 1_024 {
-            state.pending_runtime_events.pop_front();
-        }
-        let exception_id = state.runtime_exception_counter;
-        state
-            .pending_runtime_events
-            .push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
-                exception_id,
-                name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
-                description: error
-                    .stack
-                    .clone()
-                    .unwrap_or_else(|| error.exception_message.clone()),
-                url,
-                line_number,
-                column_number,
-                stack_trace,
-                timestamp,
-            }));
+        crate::ops::record_uncaught_exception(&mut self.state.borrow_mut(), error, fallback_url);
     }
 
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
@@ -1498,6 +1444,7 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_viewport_w={width};\
                  globalThis.__obscura_viewport_h={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                 globalThis.__obscura_recompute_media_queries();\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
@@ -1510,6 +1457,19 @@ impl ObscuraJsRuntime {
                  }}",
             ),
         );
+    }
+
+    /// Keep JavaScript media queries and CSS selection on the same preference.
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        #[cfg(feature = "render")]
+        {
+            let media = self.state.borrow().render_media.with_reduced_motion(reduce);
+            self.set_render_media(media);
+        }
+        let _ = self.execute_runtime_script("<reduced-motion>", format!(
+            "globalThis.__obscura_reduced_motion={reduce};\
+             globalThis.__obscura_recompute_media_queries();"
+        ));
     }
 
     /// Override the physical screen metrics exposed to page JavaScript.
@@ -1578,6 +1538,11 @@ impl ObscuraJsRuntime {
     /// Select the CSS media type for the next synchronous render flush.
     /// Changing media invalidates geometry and the compiled stylesheet key but
     /// leaves the live DOM, scroll offsets, and resource bytes untouched.
+    #[cfg(feature = "render")]
+    pub fn prefers_reduced_motion(&self) -> bool {
+        self.state.borrow().render_media.reduced_motion()
+    }
+
     #[cfg(feature = "render")]
     pub fn set_render_media(
         &self,
@@ -2400,10 +2365,23 @@ impl ObscuraJsRuntime {
     /// Run __obscura_init() after all per-page properties (UA, platform, stealth, etc.)
     /// have been set. Must be called once per page setup, after all set_* methods.
     pub fn run_page_init(&mut self) {
+        self.state.borrow_mut().navigation_timing.record("domLoading");
         let _ = self.execute_runtime_script(
             "<obscura:page-init>",
             "globalThis.__obscura_init();".to_string(),
         );
+    }
+
+    pub fn navigation_timing(&self) -> crate::ops::NavigationTiming {
+        self.state.borrow().navigation_timing.clone()
+    }
+
+    pub fn set_navigation_timing(&self, timing: crate::ops::NavigationTiming) {
+        self.state.borrow_mut().navigation_timing = timing;
+    }
+
+    pub fn record_navigation_timing(&self, name: &str) {
+        self.state.borrow_mut().navigation_timing.record(name);
     }
 
     /// Override the coordinates the navigator.geolocation shim reports. The
@@ -5043,6 +5021,36 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_input_activation_uses_the_receiver_realm() {
+        let mut rt = setup_runtime("<input id='parent' type='checkbox'><iframe></iframe>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const child = document.querySelector('iframe').contentDocument;
+            child.body.innerHTML = '<input id="control" type="checkbox">';
+            const input = child.getElementById('control');
+            const events = [];
+            input.indeterminate = true;
+            input.addEventListener('click', event => {
+                events.push(['click', input.checked, input.indeterminate]);
+                if (cancel) event.preventDefault();
+            });
+            for (const type of ['input', 'change']) {
+                input.addEventListener(type, () => events.push([type, input.checked, input.indeterminate]));
+            }
+            let cancel = true;
+            HTMLElement.prototype.click.call(input);
+            const cancelled = [input.checked, input.indeterminate,
+                document.getElementById('parent').checked, events.splice(0)];
+            cancel = false;
+            HTMLElement.prototype.click.call(input);
+            return [cancelled, [input.checked, input.indeterminate,
+                document.getElementById('parent').checked, events]];
+        })()"#).unwrap(), serde_json::json!([
+            [false, true, false, [["click", true, false]]],
+            [true, false, false, [["click", true, false], ["input", true, false], ["change", true, false]]]
+        ]));
+    }
+
+    #[test]
     fn document_open_does_not_use_overridden_head_or_body_getters() {
         let mut rt = setup_runtime(
             "<html><head><base href='https://parent.example/'></head><body>parent</body></html>");
@@ -5371,6 +5379,55 @@ mod tests {
             rt.evaluate("__taskOrder").unwrap(),
             serde_json::json!(["sync", "microtask", "timer"])
         );
+    }
+
+    #[tokio::test]
+    async fn microtask_exception_reports_error_without_discarding_queued_work() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(r#"(() => {
+            globalThis.microtaskOrder = [];
+            const failure = new Error('fixture microtask failure');
+            addEventListener('error', event => {
+                microtaskOrder.push(event.error === failure ? 'error' : 'wrong-error');
+                event.preventDefault();
+            });
+            queueMicrotask(() => microtaskOrder.push('before'));
+            queueMicrotask(() => { throw failure; });
+            queueMicrotask(() => microtaskOrder.push('after'));
+            Promise.resolve().then(() => microtaskOrder.push('promise'));
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("microtaskOrder").unwrap(),
+            serde_json::json!(["before", "error", "after", "promise"]));
+    }
+
+    #[tokio::test]
+    async fn microtask_exception_reports_only_uncanceled_runtime_errors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.set_runtime_events_enabled(true);
+        rt.evaluate(r#"(() => {
+            globalThis.reportedMicrotaskErrors = [];
+            addEventListener('error', event => {
+                reportedMicrotaskErrors.push(event.message);
+                if (event.message === 'canceled failure') event.preventDefault();
+            });
+            queueMicrotask(() => { throw new TypeError('uncanceled failure'); });
+            queueMicrotask(() => { throw new Error('canceled failure'); });
+            queueMicrotask(() => reportedMicrotaskErrors.push('after'));
+            return true;
+        })()"#).unwrap();
+        rt.run_event_loop().await.unwrap();
+        assert_eq!(rt.evaluate("reportedMicrotaskErrors").unwrap(),
+            serde_json::json!(["uncanceled failure", "canceled failure", "after"]));
+        let exceptions: Vec<_> = rt.take_pending_runtime_events().into_iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::Exception(error) => Some(error),
+                _ => None,
+            }).collect();
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].name, "TypeError");
+        assert!(exceptions[0].description.contains("uncanceled failure"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6168,6 +6225,223 @@ mod tests {
     }
 
     #[test]
+    fn user_timing_named_measures_resolve_recorded_timestamps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            performance.mark('start', {startTime: 20});
+            performance.mark('start', {startTime: 5});
+            performance.mark('end', {startTime: 12});
+            const measure = performance.measure('work', 'start', 'end');
+            return [measure.startTime, measure.duration, measure.entryType,
+                performance.getEntriesByType('mark').map(e => e.startTime),
+                performance.getEntriesByName('work', 'measure').length];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([20, -8, "measure", [5, 12, 20], 1]));
+    }
+
+    #[test]
+    fn user_timing_options_clone_details_without_registering_constructors() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const detail = {values: new Map([['count', 7]])}; detail.self = detail;
+            const entry = performance.measure('work', {start: 3, duration: 4, detail});
+            detail.values.set('count', 9);
+            const standalone = new PerformanceMark('standalone', {startTime: 2});
+            return [entry.startTime, entry.duration, entry.detail.values.get('count'),
+                entry.detail.self === entry.detail, entry instanceof PerformanceMeasure,
+                entry instanceof PerformanceEntry, Object.keys(entry),
+                Object.prototype.toString.call(entry), standalone.duration,
+                performance.getEntriesByName('standalone').length,
+                performance.measure('backward', {start: 8, end: 2}).duration,
+                performance.measure('derived', {end: 3, duration: 4}).startTime];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([3, 4, 7, true, true, true, [],
+            "[object PerformanceMeasure]", 0, 0, -6, -1]));
+    }
+
+    #[test]
+    fn user_timing_clear_methods_preserve_other_entry_types() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            performance.mark('same', {startTime: 1});
+            performance.mark('other', {startTime: 2});
+            performance.measure('same', {start: 1, end: 3});
+            performance.clearMarks('same');
+            const before = performance.getEntries().map(e => e.entryType + ':' + e.name);
+            performance.clearMeasures();
+            return [before, performance.getEntries().map(e => e.name)];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([["measure:same", "mark:other"], ["other"]]));
+    }
+
+    #[test]
+    fn user_timing_rejects_invalid_measurements_without_recording_them() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            const errors = [
+                () => performance.mark(), () => performance.measure(),
+                () => performance.mark('navigationStart'),
+                () => performance.mark('x', {startTime: -1}),
+                () => performance.mark('x', {startTime: Infinity}),
+                () => performance.mark('x', {detail: () => {}}),
+                () => performance.measure('x', 'missing'),
+                () => performance.measure('x', {duration: 2}),
+                () => performance.measure('x', {detail: 2}),
+                () => performance.measure('x', {start: 1, end: 2, duration: 1}),
+                () => performance.measure('x', {start: 1}, 'missing'),
+                () => performance.measure('x', {start: -1}),
+                () => performance.measure('x', {start: NaN}),
+                () => performance.getEntriesByName(),
+                () => new PerformanceEntry(), () => new PerformanceMeasure(),
+            ].map(fn => { try { fn(); return 'none'; } catch (error) { return error.name; } });
+            return [errors, performance.getEntries().length];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([[
+            "TypeError", "TypeError", "SyntaxError", "TypeError", "TypeError", "DataCloneError",
+            "SyntaxError", "TypeError", "TypeError", "TypeError", "TypeError", "TypeError",
+            "TypeError", "TypeError", "TypeError", "TypeError"], 0]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_timing_observer_delivers_buffered_entries_after_the_current_task() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("user-timing-observer", r#"
+            globalThis.__timingDelivery = [];
+            let synchronous = true;
+            performance.mark('old', {startTime: 9});
+            const observer = new PerformanceObserver(function(list, owner) {
+                __timingDelivery.push([!synchronous, this === owner && owner === observer,
+                    list.getEntries().map(e => e.name), list.getEntriesByName('new', 'mark').length,
+                    Object.prototype.toString.call(list)]);
+                observer.disconnect();
+            });
+            observer.observe({type: 'mark', buffered: true});
+            performance.mark('new', {startTime: 2});
+            performance.clearMarks();
+            synchronous = false;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__timingDelivery").unwrap(), serde_json::json!([
+            [true, true, ["new", "old"], 1, "[object PerformanceObserverEntryList]"]
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_timing_drained_observers_do_not_starve_other_observers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("user-timing-drain", r#"
+            globalThis.__timingDrain = {callbacks: []};
+            const drained = new PerformanceObserver(() => __timingDrain.callbacks.push('drained'));
+            const cancelled = new PerformanceObserver(() => __timingDrain.callbacks.push('cancelled'));
+            const active = new PerformanceObserver(list => {
+                __timingDrain.callbacks.push(list.getEntries().map(e => e.name));
+                active.disconnect();
+            });
+            drained.observe({type: 'mark'});
+            cancelled.observe({type: 'mark'});
+            active.observe({type: 'mark'});
+            performance.mark('first', {startTime: 5});
+            performance.mark('second', {startTime: 1});
+            __timingDrain.records = drained.takeRecords().map(e => e.name);
+            cancelled.disconnect();
+            __timingDrain.cancelledRecords = cancelled.takeRecords().length;
+            try { cancelled.observe({entryTypes: ['mark']}); }
+            catch (error) { __timingDrain.modeError = error.name; }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__timingDrain").unwrap(), serde_json::json!({
+            "callbacks": [["second", "first"]], "records": ["first", "second"],
+            "cancelledRecords": 0, "modeError": "InvalidModificationError",
+        }));
+    }
+
+    #[test]
+    fn user_timing_unknown_entry_types_return_empty_lists() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"['__proto__', 'constructor', 'toString', 'unsupported']
+            .map(type => performance.getEntriesByType(type).length)"#).unwrap();
+        assert_eq!(result, serde_json::json!([0, 0, 0, 0]));
+    }
+
+    #[test]
+    fn user_timing_webidl_dictionary_getters_are_read_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            let durationReads = 0, typeReads = 0;
+            const measure = performance.measure('work', {start: 3,
+                get duration() { durationReads++; return 4; }});
+            const observer = new PerformanceObserver(() => {});
+            observer.observe({get type() { typeReads++; return 'mark'; }});
+            observer.disconnect();
+            return [measure.duration, durationReads, typeReads];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([4, 1, 1]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_timing_buffered_observers_accept_large_timelines() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("large-timing-timeline", r#"
+            for (let i = 0; i < 150000; i++) performance.mark('work', {startTime: i});
+            globalThis.__largeTimingDelivery = [];
+            const observer = new PerformanceObserver(list => {
+                const entries = list.getEntries();
+                __largeTimingDelivery = [entries.length, entries[0].startTime,
+                    entries[entries.length - 1].startTime];
+                observer.disconnect();
+            });
+            observer.observe({type: 'mark', buffered: true});
+            performance.clearMarks();
+        "#).unwrap();
+        rt.run_event_loop_bounded(1000).await.unwrap();
+        assert_eq!(rt.evaluate("__largeTimingDelivery").unwrap(),
+            serde_json::json!([150000, 0, 149999]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn user_timing_observer_reports_dropped_entries_once_per_observe() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("timing-callback-options", r#"
+            globalThis.__timingOptions = [];
+            const observer = new PerformanceObserver((list, owner, options) => {
+                __timingOptions.push([list.getEntries().map(e => e.name),
+                    Object.hasOwn(options, 'droppedEntriesCount') ? options.droppedEntriesCount : 'unset']);
+                if (__timingOptions.length === 1) performance.mark('second');
+                else if (__timingOptions.length === 2) {
+                    owner.observe({type: 'mark'});
+                    performance.mark('third');
+                } else owner.disconnect();
+            });
+            observer.observe({type: 'mark'});
+            performance.mark('first');
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__timingOptions").unwrap(), serde_json::json!([
+            [["first"], 0], [["second"], "unset"], [["third"], 0]
+        ]));
+    }
+
+    #[test]
+    fn user_timing_interfaces_expose_inherited_operations() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(function() {
+            if (typeof Performance !== 'function') return 'Performance missing';
+            const mark = Performance.prototype.mark.call(performance, 'work', {startTime: 7});
+            const measure = Performance.prototype.measure.call(performance, 'work', {start: 7, duration: 3});
+            let illegal = 'none';
+            try { new Performance(); } catch (error) { illegal = error.name; }
+            return [performance instanceof Performance, illegal, mark.startTime, measure.duration,
+                ['mark', 'clearMarks', 'measure', 'clearMeasures'].map(name =>
+                    [Object.hasOwn(performance, name), performance[name].length, performance[name].name]),
+                ['Performance', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceObserver'].map(name =>
+                    Object.getOwnPropertyDescriptor(globalThis, name).enumerable)];
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true, "TypeError", 7, 3,
+            [[false, 1, "mark"], [false, 0, "clearMarks"], [false, 1, "measure"],
+                [false, 0, "clearMeasures"]], [false, false, false, false]]));
+    }
+
+    #[test]
     fn performance_now_is_monotonic_under_bursty_calls() {
         let mut rt = setup_runtime("<html><body></body></html>");
         // Hammer performance.now() so many calls land in the same millisecond and
@@ -6182,6 +6456,36 @@ mod tests {
             Some(0.0),
             "performance.now() went backwards"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn document_close_navigation_timing_records_real_lifecycle_only_once() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate("performance.timing.loadEventEnd").unwrap().as_f64(), Some(0.0));
+        rt.execute_script("document-close-timing", r#"
+            document.open();
+            globalThis.samples = [];
+            document.addEventListener('DOMContentLoaded', () => samples.push([
+                performance.timing.domContentLoadedEventStart, performance.timing.domContentLoadedEventEnd]));
+            window.addEventListener('load', () => samples.push([
+                performance.timing.loadEventStart, performance.timing.loadEventEnd]));
+            Date.now = () => 0;
+            document.write('<p>Written document</p>'); document.close();
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate(r#"(() => {
+            const [dom, load] = samples;
+            const end = performance.timing.loadEventEnd;
+            const origin = performance.timeOrigin;
+            window.dispatchEvent(new Event('load'));
+            document.open(); document.write('<p>Written again</p>'); document.close();
+            return [dom[0] > 0 && dom[1] === 0, load[0] > 0 && load[1] === 0,
+                end >= load[0], performance.timing.loadEventEnd === end,
+                performance.timeOrigin === origin];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true]));
+        let before = rt.evaluate("[performance.timeOrigin, performance.timing.loadEventEnd]").unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("[performance.timeOrigin, performance.timing.loadEventEnd]").unwrap(), before);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -17324,6 +17628,70 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn response_constructor_validates_public_init_without_forging_network_metadata() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const error = callback => { try { callback(); return null; } catch (e) { return e.name; } };
+            const response = new Response(null, {type:'opaque',url:'https://example.com/',redirected:true});
+            let statusReads = 0;
+            const singleRead = new Response(null, {get status(){statusReads++;return 201;}});
+            return {
+                ordinary:[response.type,response.url,response.redirected,String(response.status)],
+                invalidStatus:[0,100,199,600,1000].map(status=>error(()=>new Response('',{status}))),
+                conversion:[65736,200.9,'201'].map(status=>String(new Response(null,{status}).status)),
+                invalidStatusText:['\n','\r','\0','\u0100'].map(statusText=>error(()=>new Response(null,{statusText}))),
+                validStatusText:['\tOK','\u0080'].map(statusText=>new Response(null,{statusText}).statusText),
+                nullBodyStatus:[204,205,304].map(status=>error(()=>new Response('',{status}))),
+                nullBodyAllowed:[204,205,304].map(status=>new Response(null,{status}).body),
+                nullInit:String(new Response(null,null).status),
+                getter:[String(singleRead.status),String(statusReads)]
+            };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "ordinary":["default","",false,"200"],
+            "invalidStatus":["RangeError","RangeError","RangeError","RangeError","RangeError"],
+            "conversion":["200","200","201"],
+            "invalidStatusText":["TypeError","TypeError","TypeError","TypeError"],
+            "validStatusText":["\tOK","\u{0080}"],
+            "nullBodyStatus":["TypeError","TypeError","TypeError"],
+            "nullBodyAllowed":[null,null,null],
+            "nullInit":"200",
+            "getter":["201","1"]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_factories_validate_redirects_and_json_and_preserve_error_clones() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const error = callback => { try { callback(); return null; } catch (e) { return e.name; } };
+            const networkError = Response.error();
+            const copy = networkError.clone();
+            const redirect = Response.redirect('https://example.com/a/../b');
+            const json = Response.json({ok:true},{headers:new Headers({'x-check':'preserved'})});
+            return {
+                error:[networkError.type,String(networkError.status),networkError.body],
+                clone:[copy.type,String(copy.status),copy.body],
+                redirect:[redirect.type,String(redirect.status),redirect.headers.get('location')],
+                invalidRedirectStatus:[0,200,309,400,500].map(status=>error(()=>Response.redirect('https://example.com/',status))),
+                invalidRedirectUrl:error(()=>Response.redirect('https://[invalid')),
+                json:[json.type,json.headers.get('content-type'),json.headers.get('x-check')],
+                jsonUndefined:error(()=>Response.json(undefined)),
+                jsonSymbol:error(()=>Response.json(Symbol('value'))),
+                jsonNullBodyStatus:[204,205,304].map(status=>error(()=>Response.json('body',{status})))
+            };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "error":["error","0",null], "clone":["error","0",null],
+            "redirect":["default","302","https://example.com/b"],
+            "invalidRedirectStatus":["RangeError","RangeError","RangeError","RangeError","RangeError"],
+            "invalidRedirectUrl":"TypeError", "json":["default","application/json","preserved"],
+            "jsonUndefined":"TypeError", "jsonSymbol":"TypeError",
+            "jsonNullBodyStatus":["TypeError","TypeError","TypeError"]
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn response_body_exposes_stream_and_consumption_state() {
         // #818: a non-null Response body must expose a ReadableStream through
         // .body, a boolean .bodyUsed, and a working getReader(); consuming
@@ -20648,6 +21016,88 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!(["TypeError", "TypeError"])
+        );
+    }
+
+    // body.offsetParent returned body itself, so walking offsetParent to
+    // the top (how pages compute an element's page position) looped forever.
+    #[test]
+    fn test_offset_parent_of_body_and_root_is_null() {
+        let mut rt = setup_runtime(
+            "<html><body><div style=\"position:relative\"><p id=\"p\">x</p></div></body></html>",
+        );
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                const walk = [];
+                for (let el = document.getElementById("p"); el && walk.length < 10; el = el.offsetParent) {
+                    walk.push(el.tagName);
+                }
+                return {
+                    body: document.body.offsetParent,
+                    root: document.documentElement.offsetParent,
+                    walk: walk.join(">"),
+                };
+            })()"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({"body": null, "root": null, "walk": "P>DIV>BODY"})
+        );
+    }
+
+    #[test]
+    fn style_set_property_converts_value_once_before_comparing_and_storing() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            let conversions = 0;
+            document.body.style.setProperty('top', {
+                toString() { return `${++conversions * 10}px`; }
+            });
+            return {conversions:String(conversions), value:document.body.style.top};
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!({"conversions":"1", "value":"10px"}));
+    }
+
+    // An unchanged style.setProperty rewrote the style attribute and queued a
+    // mutation record, so an observer that re-applies the same style (pinning
+    // body `top: 0`) re-triggered itself forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_style_set_property_without_change_queues_no_mutation() {
+        let mut rt = setup_runtime("<html><body><p>x</p></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const body = document.body;
+                let calls = 0, records = 0;
+                const observer = new MutationObserver((mutations) => {
+                    calls++;
+                    records += mutations.length;
+                    if (calls < 50) body.style.setProperty("top", "0px", "important");
+                });
+                observer.observe(document.documentElement, {
+                    subtree: true, attributes: true, attributeFilter: ["style"],
+                });
+                body.style.setProperty("top", "0px", "important");
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                body.style.removeProperty("left");
+                body.style.top = "0px";
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                observer.disconnect();
+                return { calls, records, style: body.getAttribute("style") };
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({"calls": 1, "records": 1, "style": "top: 0px;"})
         );
     }
 
