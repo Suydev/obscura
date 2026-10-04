@@ -503,7 +503,7 @@ pub fn retained_attribute_mutation_kind(
             | "viewbox"
             | "width"
     ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
-        || (local == "select" && name == "size")
+        || (matches!(local.as_str(), "select" | "font") && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
     {
@@ -2119,6 +2119,9 @@ struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
     runs: HashMap<NodeId, Vec<usize>>,
     word_items: HashMap<NodeId, Vec<usize>>,
+    /// Zero-sized inline placeholders retain out-of-flow source positions
+    /// without changing the real box's percentage containing block.
+    static_positions: HashMap<NodeId, taffy::NodeId>,
     generated: Vec<GeneratedBoxBuild>,
     /// Specified column widths per table grid node, from `<col>` elements and
     /// colspan-1 cells: `(px, percent)` per column index. Consumed by the
@@ -2394,9 +2397,38 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
     }
 }
 
+/// https://html.spec.whatwg.org/multipage/rendering.html#rules-for-parsing-a-legacy-font-size
+fn legacy_font_size_hint(value: &str) -> Option<&'static str> {
+    let value = value.trim_start_matches(['\t', '\n', '\u{c}', '\r', ' ']);
+    let (base, sign, digits) = if let Some(digits) = value.strip_prefix('+') {
+        (3, 1, digits)
+    } else if let Some(digits) = value.strip_prefix('-') {
+        (3, -1, digits)
+    } else {
+        (0, 1, value)
+    };
+    let mut digits = digits.bytes().take_while(u8::is_ascii_digit);
+    let first = digits.next()?;
+    // Only the clamped 1..7 result matters, so arbitrarily long inputs cannot overflow.
+    let value = digits.fold((first - b'0').min(7) as i8, |value, digit| {
+        (value * 10 + (digit - b'0') as i8).min(7)
+    });
+    Some([
+        "font-size:x-small", "font-size:small", "font-size:medium",
+        "font-size:large", "font-size:x-large", "font-size:xx-large", "font-size:xxx-large",
+    ][((base + sign * value).clamp(1, 7) - 1) as usize])
+}
+
 /// Apply HTML presentational attributes at their cascade origin: above the UA
 /// defaults, but below every author stylesheet and style attribute.
 fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+    if node.as_element().is_some_and(|name| {
+        name.local.as_ref() == "font" && name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+    }) {
+        if let Some(hint) = node.get_attribute("size").and_then(legacy_font_size_hint) {
+            crate::style::apply_inline(style, hint);
+        }
+    }
     if let Some(direction) = node.get_attribute("dir") {
         style.direction = match direction.trim().to_ascii_lowercase().as_str() {
             "ltr" => Some(taffy::Direction::Ltr),
@@ -6812,15 +6844,13 @@ fn layout_dom_once(
                 initial_containing_block,
                 &id_map,
                 &styles,
+                &ifc_items.static_positions,
             );
             let available = taffy::Size {
                 width: taffy::AvailableSpace::Definite(initial_cb_width),
                 height: taffy::AvailableSpace::Definite(viewport.1),
             };
-            #[cfg(feature = "paint")]
-            {
-                let engine = &mut engine;
-                let mut measure = |known: taffy::Size<Option<f32>>,
+            let mut measure = |known: taffy::Size<Option<f32>>,
                                    avail: taffy::Size<taffy::AvailableSpace>,
                                    _node,
                                    ctx: Option<&mut usize>,
@@ -6830,6 +6860,9 @@ fn layout_dom_once(
                         None => taffy::Size::ZERO,
                     }
                 };
+
+            #[cfg(feature = "paint")]
+            {
 
                 // Table used-width pass. A grid table is built at width:auto, so
                 // its final width has to be chosen the way CSS chooses a table's
@@ -7359,7 +7392,7 @@ fn layout_dom_once(
             }
             #[cfg(not(feature = "paint"))]
             {
-                let _ = taffy_tree.compute_layout(taffy_root, available);
+                let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 if deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
@@ -7367,19 +7400,20 @@ fn layout_dom_once(
                         &styles,
                         initial_cb_width,
                         |tree, node, width| {
-                            tree.compute_layout(
+                            tree.compute_layout_with_measure(
                                 node,
                                 taffy::Size {
                                     width,
                                     height: taffy::AvailableSpace::MaxContent,
                                 },
+                                &mut measure,
                             )
                             .ok()?;
                             tree.layout(node).ok().map(|layout| layout.size.width)
                         },
                     )
                 {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if resolve_atomic_percentage_heights(
                     tree,
@@ -7389,11 +7423,11 @@ fn layout_dom_once(
                     &styles,
                     &definite_height_nodes,
                 ) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
                 {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 let _ = resolve_deferred_flex_inline_sizes(
                     tree,
@@ -7406,7 +7440,7 @@ fn layout_dom_once(
                     vh,
                     |tree, resolved_styles, phase| match phase {
                         DeferredFlexReflowPhase::Layout => {
-                            let _ = tree.compute_layout(taffy_root, available);
+                            let _ = tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                         }
                         DeferredFlexReflowPhase::FitContent => {
                             if apply_fit_content_widths(
@@ -7415,30 +7449,31 @@ fn layout_dom_once(
                                 resolved_styles,
                                 initial_cb_width,
                                 |tree, node, width| {
-                                    tree.compute_layout(
+                                    tree.compute_layout_with_measure(
                                         node,
                                         taffy::Size {
                                             width,
                                             height: taffy::AvailableSpace::MaxContent,
                                         },
+                                        &mut measure,
                                     )
                                     .ok()?;
                                     tree.layout(node).ok().map(|layout| layout.size.width)
                                 },
                             ) {
-                                let _ = tree.compute_layout(taffy_root, available);
+                                let _ = tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                             }
                         }
                     },
                 );
                 if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_full_span_column_subgrids(
                     tree,
@@ -7446,21 +7481,22 @@ fn layout_dom_once(
                     &id_map,
                     &styles,
                     |tree, node| {
-                        tree.compute_layout(
+                        tree.compute_layout_with_measure(
                             node,
                             taffy::Size {
                                 width: taffy::AvailableSpace::MaxContent,
                                 height: taffy::AvailableSpace::MaxContent,
                             },
+                            &mut measure,
                         )
                         .ok()?;
                         tree.layout(node).ok().map(|layout| layout.size.width)
                     },
                 ) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 // Keep the no-paint geometry path in the same final-position
                 // contract as screenshots: static coordinates are resolved
@@ -7470,7 +7506,7 @@ fn layout_dom_once(
                         &mut taffy_tree,
                         &static_position_candidates,
                     );
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
             }
             sync_resolved_percentage_padding(
@@ -8796,6 +8832,7 @@ fn compute_absolute_rects(
 struct StaticPositionCandidate {
     child: taffy::NodeId,
     target: taffy::NodeId,
+    placeholder: Option<taffy::NodeId>,
     inline_axis: bool,
     block_axis: bool,
 }
@@ -8815,6 +8852,7 @@ fn reparent_inset_positioned_nodes(
     taffy_root: taffy::NodeId,
     id_map: &HashMap<taffy::NodeId, NodeId>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
+    static_positions: &HashMap<NodeId, taffy::NodeId>,
 ) -> Vec<StaticPositionCandidate> {
     let reverse: HashMap<NodeId, taffy::NodeId> = id_map
         .iter()
@@ -8871,13 +8909,15 @@ fn reparent_inset_positioned_nodes(
         let Some(current) = taffy_tree.parent(child) else {
             continue;
         };
-        if current == target {
+        let placeholder = static_positions.get(&dom_id).copied();
+        if current == target && placeholder.is_none() {
             continue;
         }
         if !has_block_inset || !has_inline_inset {
             static_candidates.push(StaticPositionCandidate {
                 child,
                 target,
+                placeholder,
                 inline_axis: !has_inline_inset,
                 block_axis: !has_block_inset,
             });
@@ -9628,7 +9668,9 @@ fn resolve_static_positions_and_reparent(
     // coordinates.
     let mut resolved = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let Some(child_origin) = taffy_global_origin(taffy_tree, candidate.child) else {
+        let Some(child_origin) = taffy_global_origin(
+            taffy_tree, candidate.placeholder.unwrap_or(candidate.child),
+        ) else {
             continue;
         };
         let Some(target_origin) = taffy_global_origin(taffy_tree, candidate.target) else {
@@ -9637,7 +9679,11 @@ fn resolve_static_positions_and_reparent(
         let Ok(child_layout) = taffy_tree.layout(candidate.child) else {
             continue;
         };
-        let child_margin = child_layout.margin;
+        let child_margin = if candidate.placeholder.is_some() {
+            taffy::Rect::ZERO
+        } else {
+            child_layout.margin
+        };
         let Ok(target_layout) = taffy_tree.layout(candidate.target) else {
             continue;
         };
@@ -12027,6 +12073,14 @@ fn assign_native_control_size(
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    if stretch_inline || stretch_block {
+        // Stretch controls the final size, not the intrinsic track contribution.
+        // Measure content axes independently; native controls have no natural ratio.
+        style.intrinsic_size = Some((
+            (intrinsic_width - horizontal_edges).max(0.0),
+            (intrinsic_height - vertical_edges).max(0.0),
+        ));
+    }
     if style.width == crate::Dimension::Auto && !stretch_inline {
         let declared = if content_box {
             (intrinsic_width - horizontal_edges).max(0.0)
@@ -12870,6 +12924,15 @@ fn build(
         }
     }
 
+    if matches!(_name.local.as_ref(), "input" | "select" | "textarea") {
+        if let Some((width, height)) = style.intrinsic_size {
+            let context = engine.register_native_control(width, height, style);
+            let leaf = taffy_tree.new_leaf_with_context(taffy_style, context).ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
+        }
+    }
+
     // An inline SVG is an atomic replaced box in the surrounding formatting
     // context. Its descendants paint inside its SVG viewport; they must not
     // become CSS layout children. In particular, a viewBox supplies an
@@ -13522,9 +13585,9 @@ fn inline_wrapper_float(
 ///   word: faster and lighter than the old whole-container promotion). Runs
 ///   holding atomic inline boxes (img, inline-block, ...) fall back to an
 ///   anonymous flex-wrap wrapper around the run's boxes;
-/// - out-of-flow (absolutely positioned) children neither join nor break a
-///   run; they are appended after the flow children so their containing
-///   block is this parent, whose used width they resolve percentages against.
+/// - out-of-flow children do not break a run. Inline static-position markers
+///   retain their source position, while the real boxes remain direct children
+///   of this parent so percentages resolve against its containing block.
 #[allow(clippy::too_many_arguments)]
 fn build_mixed_block(
     tree: &DomTree,
@@ -13553,9 +13616,11 @@ fn build_mixed_block(
     enum Seg {
         Run(Vec<NodeId>),
         Block(NodeId),
+        OutOfFlow(NodeId),
     }
     let mut segs: Vec<Seg> = Vec::new();
     let mut out_of_flow: Vec<NodeId> = Vec::new();
+    let mut run_index = None;
     for &cid in &flat {
         let Some(node) = tree.borrow_node(cid) else {
             continue;
@@ -13576,22 +13641,36 @@ fn build_mixed_block(
                 continue;
             }
             if matches!(s.position, Some(taffy::Position::Absolute)) {
-                out_of_flow.push(cid);
-                continue;
+                if s.static_position_inline &&
+                    ((s.inset[0].is_none() && s.inset[2].is_none()) ||
+                     (s.inset[1].is_none() && s.inset[3].is_none()))
+                {
+                    out_of_flow.push(cid);
+                    true
+                } else {
+                    segs.push(Seg::OutOfFlow(cid));
+                    continue;
+                }
+            } else {
+                let is_forced_break = node
+                    .as_element()
+                    .map_or(false, |element| element.local.as_ref() == "br");
+                is_forced_break || crate::is_inline_level_box(s)
             }
-            let is_forced_break = node
-                .as_element()
-                .map_or(false, |element| element.local.as_ref() == "br");
-            is_forced_break || crate::is_inline_level_box(s)
         } else {
             false
         };
         if inline_level {
-            match segs.last_mut() {
-                Some(Seg::Run(run)) => run.push(cid),
-                _ => segs.push(Seg::Run(vec![cid])),
+            if let Some(index) = run_index {
+                if let Seg::Run(run) = &mut segs[index] {
+                    run.push(cid);
+                }
+            } else {
+                run_index = Some(segs.len());
+                segs.push(Seg::Run(vec![cid]));
             }
         } else {
+            run_index = None;
             segs.push(Seg::Block(cid));
         }
     }
@@ -13622,13 +13701,19 @@ fn build_mixed_block(
     let mut before_pending = !before_block && !before_leaves.is_empty();
     let mut after_pending = !after_block && !after_leaves.is_empty();
 
-    let n_segs = segs.len();
+    let first_flow = segs.iter().position(|seg| !matches!(seg, Seg::OutOfFlow(_)));
+    let last_flow = segs.iter().rposition(|seg| !matches!(seg, Seg::OutOfFlow(_)));
     let mut child_ids: Vec<taffy::NodeId> = Vec::new();
     if before_block {
         child_ids.extend(before_leaves.iter().copied());
     }
     for (i, seg) in segs.into_iter().enumerate() {
         match seg {
+            Seg::OutOfFlow(cid) => {
+                child_ids.extend(build_any(
+                    tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
+                ));
+            }
             Seg::Block(cid) => {
                 let built = build_any(
                     tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
@@ -13679,8 +13764,8 @@ fn build_mixed_block(
                     .map(|index| index + 1)
                     .unwrap_or(start);
                 let run = &run[start..end];
-                let join_before = before_pending && i == 0;
-                let join_after = after_pending && i + 1 == n_segs;
+                let join_before = before_pending && Some(i) == first_flow;
+                let join_after = after_pending && Some(i) == last_flow;
                 // Fast path: the whole run folds to one shaped leaf, unless
                 // pseudo-content word leaves must share its lines.
                 if !join_before && !join_after {
@@ -13699,6 +13784,21 @@ fn build_mixed_block(
                     before_pending = false;
                 }
                 for &rc in run {
+                    if styles.get(&rc).is_some_and(|s| {
+                        matches!(s.position, Some(taffy::Position::Absolute))
+                    }) {
+                        let placeholder = taffy_tree.new_leaf(taffy::Style {
+                            size: taffy::Size {
+                                width: taffy::Dimension::length(0.0),
+                                height: taffy::Dimension::length(0.0),
+                            },
+                            flex_shrink: 0.0,
+                            ..Default::default()
+                        }).ok()?;
+                        ifc_items.static_positions.insert(rc, placeholder);
+                        atoms.push(placeholder);
+                        continue;
+                    }
                     let is_forced_break = tree.borrow_node(rc).is_some_and(|node| {
                         node.as_element()
                             .is_some_and(|element| element.local.as_ref() == "br")
@@ -13955,7 +14055,7 @@ fn inline_wraps_only_in_flow_blocks(
 /// computed text styles. Preserve wrappers the text engine can fold so their
 /// shaped runs retain element geometry; expose block-in-inline descendants
 /// early enough for anonymous block construction.
-fn flatten_boxless_inline_children(
+pub(crate) fn flatten_boxless_inline_children(
     tree: &DomTree,
     children: &[NodeId],
     styles: &HashMap<NodeId, crate::LayoutStyle>,
@@ -19878,6 +19978,87 @@ mod tests {
         let tree = parse_html("");
         let laid = layout_dom(&tree, (1280.0, 720.0));
         assert!(laid.rects.len() <= 4, "got {}", laid.rects.len());
+    }
+
+    #[test]
+    fn legacy_font_size_hints_follow_numeric_rules_and_author_cascade() {
+        let cases = [
+            ("1", 10.0), ("2", 13.0), ("3", 16.0), ("4", 18.0),
+            ("5", 24.0), ("6", 32.0), ("7", 48.0), ("0", 10.0), ("8", 48.0),
+            ("+1", 18.0), ("-1", 13.0), ("-2", 10.0), ("+0", 16.0), ("-0", 16.0),
+            (" \t+2tail", 24.0), ("\n2", 13.0),
+            ("999999999999999999999999", 48.0), ("-999999999999999999999999", 10.0),
+            ("", 20.0), ("word", 20.0), ("+ 1", 20.0), ("- 1", 20.0), ("\u{a0}2", 20.0),
+        ];
+        let mut html = String::from("<!doctype html><style>html{font-size:16px}body{font-size:20px}#sheet{font-size:21px}</style>");
+        for (index, (size, _)) in cases.iter().enumerate() {
+            html.push_str(&format!("<font id=f{index} size='{size}'><span id=c{index}>x</span></font>"));
+        }
+        html.push_str("<font id=sheet size=1>x</font><font id=inline size=1 style='font-size:23px'>x</font><span id=ordinary size=1>x</span>");
+        let tree = parse_html(&html);
+        let laid = layout_dom(&tree, (640.0, 480.0));
+        for (index, (size, expected)) in cases.iter().enumerate() {
+            for id in [format!("f{index}"), format!("c{index}")] {
+                let node = tree.get_element_by_id(&id).unwrap();
+                assert_eq!(laid.styles[&node].font_size, Some(*expected), "{id}: size={size:?}");
+            }
+        }
+        for (id, expected) in [("sheet", 21.0), ("inline", 23.0), ("ordinary", 20.0)] {
+            let node = tree.get_element_by_id(id).unwrap();
+            assert_eq!(laid.styles[&node].font_size, Some(expected), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_font_size_mutations_restyle_inherited_descendants() {
+        let tree = parse_html("<!doctype html><style>body{font-size:20px}</style><font id=font size=1><span id=child>x</span></font><aside>clean</aside>");
+        let font = tree.get_element_by_id("font").unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        let viewport = (640.0, 480.0);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree, viewport, &HashMap::new(), &[], &mut cache,
+        );
+        assert_eq!(initial.styles[&font].font_size, Some(10.0));
+        for (old, new, expected) in [(Some("1"), Some("6"), 32.0), (Some("6"), None, 20.0)] {
+            tree.with_node_mut(font, |node| {
+                if let Some(value) = new { node.set_attribute("size", value.into()); }
+                else { node.remove_attribute_ns("", "size"); }
+            });
+            let retained = RetainedStyleMaps {
+                styles: std::mem::take(&mut initial.styles),
+                custom_properties: std::mem::take(&mut initial.custom_properties),
+            };
+            let (incremental, _) = layout_dom_with_web_fonts_pass_limit(
+                &tree, viewport, &HashMap::new(), &[], None, Some(&mut cache), Some(retained),
+                &[AttributeStyleMutation { node: font, name: "size".into(),
+                    old_value: old.map(str::to_owned), new_value: new.map(str::to_owned) }.into()],
+            );
+            for node in [font, child] {
+                assert_eq!(incremental.styles[&node].font_size, Some(expected), "size={new:?}");
+            }
+            let full = layout_dom(&tree, viewport);
+            assert_computed_styles_match("font size mutation", &incremental, &full);
+            assert_eq!(incremental.rects, full.rects);
+            initial = incremental;
+        }
+    }
+
+    #[test]
+    fn absolute_font_size_keywords_use_the_default_medium_scale() {
+        let cases = [("xx-small", 9.0), ("x-small", 10.0), ("small", 13.0),
+            ("medium", 16.0), ("large", 18.0), ("x-large", 24.0),
+            ("xx-large", 32.0), ("xxx-large", 48.0)];
+        let mut html = String::from("<!doctype html><style>html{font-size:16px}body{font-size:20px}</style>");
+        for (index, (keyword, _)) in cases.iter().enumerate() {
+            html.push_str(&format!("<span id=k{index} style='font-size:{keyword}'>x</span>"));
+        }
+        let tree = parse_html(&html);
+        let laid = layout_dom(&tree, (640.0, 480.0));
+        for (index, (keyword, expected)) in cases.iter().enumerate() {
+            let node = tree.get_element_by_id(&format!("k{index}")).unwrap();
+            assert_eq!(laid.styles[&node].font_size, Some(*expected), "{keyword}");
+        }
     }
 
     #[test]
