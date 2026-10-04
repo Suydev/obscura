@@ -20637,6 +20637,117 @@ mod tests {
         assert_eq!(rt.get_network_response_body(&request_id).unwrap().body, "arrived");
     }
 
+    async fn assert_script_fetch_xhr_destinations(fulfilled: bool, stealth: bool) {
+        const BODY: &str = "globalThis.destinationLoaded = 1;";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        if fulfilled {
+            drop(listener);
+        } else {
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    stream.read(&mut request).unwrap();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", BODY.len(), BODY).unwrap();
+                }
+            });
+        }
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+            )));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let capture = requests.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            capture.lock().unwrap().push(request.resource_type);
+        }));
+        let capture = responses.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, _| {
+            capture.lock().unwrap().push(request.resource_type);
+        }));
+        rt.set_callbacks(callbacks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if fulfilled {
+            rt.set_intercept_tx(tx);
+            rt.set_intercept_enabled(true);
+        }
+        let load = rt.call_function_on_for_cdp(
+            r#"async () => {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = '/same.js';
+                    script.onload = resolve; script.onerror = reject;
+                    document.head.append(script);
+                });
+                const fetched = await (await fetch('/same.js', {resourceType: 'Script'})).text();
+                const xhrBody = await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest(); xhr.open('GET', '/same.js');
+                    xhr.onload = () => resolve(xhr.responseText); xhr.onerror = reject; xhr.send();
+                });
+                return [globalThis.destinationLoaded, fetched, xhrBody];
+            }"#, None, &[], true, true,
+        );
+        let resolve = async {
+            let mut types = Vec::new();
+            if fulfilled {
+                for _ in 0..3 {
+                    let request = rx.recv().await.unwrap();
+                    types.push(request.resource_type);
+                    request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                        status: 200, headers: std::collections::HashMap::new(),
+                        body: BODY.to_string(), body_base64: String::new(),
+                    }).unwrap();
+                }
+            }
+            types
+        };
+        let (result, intercepted) = tokio::time::timeout(
+            std::time::Duration::from_secs(5), async { tokio::join!(load, resolve) },
+        ).await.expect("dynamic resources complete");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!([1, BODY, BODY]));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.iter().map(|event| event.resource_type.as_str()).collect::<Vec<_>>(),
+            vec!["Script", "Fetch", "XHR"]);
+        for event in &events {
+            assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, BODY);
+        }
+        if fulfilled {
+            assert_eq!(intercepted, vec!["Script", "Fetch", "XHR"]);
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(responses.lock().unwrap().is_empty());
+        } else {
+            let expected = vec![obscura_net::ResourceType::Script, obscura_net::ResourceType::Fetch,
+                obscura_net::ResourceType::Xhr];
+            assert_eq!(*requests.lock().unwrap(), expected);
+            assert_eq!(*responses.lock().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_resource_destinations_reach_network_events_and_callbacks() {
+        assert_script_fetch_xhr_destinations(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_resource_destinations_survive_interception_fulfillment() {
+        assert_script_fetch_xhr_destinations(true, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_dynamic_resource_destinations_reach_network_events_and_callbacks() {
+        assert_script_fetch_xhr_destinations(false, true).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_response_reports_the_final_redirect_url() {
         let mut rt = redirect_chain_runtime(3);

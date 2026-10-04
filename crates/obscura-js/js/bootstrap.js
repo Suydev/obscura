@@ -390,7 +390,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", true
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -626,7 +626,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   }
   seen.add(url);
   const raw = await __obscuraCore.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", true
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", "Stylesheet"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -4682,7 +4682,7 @@ class Element extends Node {
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', true
+      'no-cors', 'same-origin', 'Document'
     ).then(raw => {
       if (el._iframeLoadingUrl !== fullUrl) return;
       const response = JSON.parse(raw);
@@ -7814,7 +7814,7 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
-globalThis.fetch = async (input, init = {}) => {
+async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -7848,7 +7848,7 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, false);
+  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, resourceType);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -7886,7 +7886,8 @@ globalThis.fetch = async (input, init = {}) => {
     });
   }
   return response;
-};
+}
+globalThis.fetch = (input, init = {}) => _fetch(input, init);
 
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
@@ -8017,13 +8018,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     // Same rule as fetch: always resolve through the URL parser.
     let url = _resolveUrl(this._url);
 
-    fetch(url, {
+    _fetch(url, {
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
-    }).then(async (resp) => {
+    }, 'XHR').then(async (resp) => {
       if (xhr._aborted) return;
 
       xhr.status = resp.status;

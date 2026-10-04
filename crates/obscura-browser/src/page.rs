@@ -4270,7 +4270,7 @@ impl Page {
                 intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
-                resource_type: "Fetch".to_string(),
+                resource_type: ev.resource_type,
                 status: ev.status,
                 headers: std::collections::HashMap::new(),
                 response_headers: Arc::new(ev.response_headers),
