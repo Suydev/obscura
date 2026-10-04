@@ -266,6 +266,7 @@ pub struct Page {
     /// keeps this baseline across subsequent override calls and restores it
     /// only when the override is cleared.
     device_metrics_baseline: Option<DeviceMetricsBaseline>,
+    reduced_motion: bool,
     /// Output device pixels per CSS pixel for CDP surface capture. Layout and
     /// CSSOM stay in CSS pixels; Emulation.setDeviceMetricsOverride owns this
     /// independent raster scale.
@@ -1108,6 +1109,7 @@ impl Page {
             screen_metrics_emulated: false,
             locale_override: None,
             device_metrics_baseline: None,
+            reduced_motion: false,
             device_scale_factor: 1.0,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
@@ -1693,6 +1695,13 @@ impl Page {
         self.set_device_scale_factor(baseline.device_scale_factor);
     }
 
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        self.reduced_motion = reduce;
+        if let Some(js) = &mut self.js {
+            js.set_reduced_motion(reduce);
+        }
+    }
+
     /// Set the screenshot surface density without changing CSS layout. CDP
     /// uses zero to disable its override, which restores the native 1x surface
     /// in Obscura's headless-only model.
@@ -1846,6 +1855,7 @@ impl Page {
 
         rt.set_navigation_timing(self.navigation_timing.clone());
         rt.run_page_init();
+        rt.set_reduced_motion(self.reduced_motion);
         let _ = rt.execute_script(
             "<device-metrics>",
             &format!("globalThis.devicePixelRatio={};", self.device_scale_factor),
@@ -3746,7 +3756,7 @@ impl Page {
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html(
-            "<!DOCTYPE html><html><head></head><body></body></html>",
+            "<html><head></head><body></body></html>",
         ));
         self.title = String::new();
         self.lifecycle = LifecycleState::Loaded;
@@ -4261,7 +4271,7 @@ impl Page {
                 intercepted: ev.intercepted,
                 url: ev.url,
                 method: ev.method,
-                resource_type: "Fetch".to_string(),
+                resource_type: ev.resource_type,
                 status: ev.status,
                 headers: std::collections::HashMap::new(),
                 response_headers: Arc::new(ev.response_headers),
@@ -4998,6 +5008,19 @@ mod tests {
     use super::remaining_settle_resource_warmup_ms;
     use base64::Engine as _;
     use obscura_dom::parse_html;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blank_navigation_has_no_doctype_and_starts_in_quirks_mode() {
+        let context = std::sync::Arc::new(crate::BrowserContext::new("blank-mode".into()));
+        let mut page = super::Page::new("blank-mode".into(), context);
+        page.navigate("about:blank").await.unwrap();
+        assert_eq!(page.evaluate(r#"(() => [
+            document.compatMode, document.doctype,
+            Array.from(document.childNodes, node => node.nodeType),
+            document.documentElement.nodeName, document.head.nodeName, document.body.nodeName
+        ])()"#), serde_json::json!(["BackCompat", null, [1], "HTML", "HEAD", "BODY"]));
+        assert!(page.with_dom(|dom| dom.is_quirks()).unwrap());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn network_idle_quiet_deadline_does_not_gain_an_extra_polling_slice() {
@@ -8336,9 +8359,20 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0u8; 2048];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let first = String::from_utf8_lossy(&request[..read])
+                        // Accepted sockets can inherit the listener's nonblocking
+                        // mode. Consume the complete request before responding,
+                        // including fragmented headers.
+                        stream.set_nonblocking(false).unwrap();
+                        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                            let size = stream.read(&mut chunk).unwrap();
+                            assert_ne!(size, 0, "request closed before its headers completed");
+                            request.extend_from_slice(&chunk[..size]);
+                            assert!(request.len() <= 16_384, "fixture request headers too large");
+                        }
+                        let first = String::from_utf8_lossy(&request)
                             .lines()
                             .next()
                             .unwrap_or_default()
