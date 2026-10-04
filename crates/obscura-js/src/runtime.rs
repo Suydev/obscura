@@ -8518,6 +8518,35 @@ mod tests {
     }
 
     #[test]
+    fn readonly_controls_reflect_boolean_attributes_without_polluting_other_elements() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const enumerated = [];
+            const states = ['input', 'textarea'].map(tag => {
+                const field = document.createElement(tag);
+                const values = [[field.readOnly, field.getAttribute('readonly')]];
+                field.readOnly = true;
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                field.readOnly = false;
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                field.setAttribute('readonly', 'false');
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                field.removeAttribute('readonly');
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                for (const key in field) if (key === 'readOnly') enumerated.push(field[key]);
+                return values;
+            });
+            return [states, 'readOnly' in document.createElement('div'), enumerated];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [
+                [[false, null], [true, ""], [false, null], [true, "false"], [false, null]],
+                [[false, null], [true, ""], [false, null], [true, "false"], [false, null]]
+            ], false, [false, false]
+        ]));
+    }
+
+    #[test]
     fn hyperlink_content_attributes_reflect_through_the_idl_surface() {
         let mut rt = setup_runtime(
             r#"<html><body>

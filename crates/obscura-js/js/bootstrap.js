@@ -12851,7 +12851,10 @@ globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = class HTMLInputElement extends Element {};
+globalThis.HTMLInputElement = class HTMLInputElement extends Element {
+  get readOnly() { return this.hasAttribute('readonly'); }
+  set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+};
 // Framework value trackers read own prototype descriptors, not inherited ones.
 Object.defineProperties(HTMLInputElement.prototype, {
   value: Object.getOwnPropertyDescriptor(Element.prototype, 'value'),
@@ -12882,6 +12885,8 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
 };
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
+  get readOnly() { return this.hasAttribute('readonly'); }
+  set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
   // `rows`/`cols` reflect the content attributes and drive the control's
   // intrinsic box (the renderer sizes a textarea from them). The attributes
   // are limited to positive non-zero numbers; anything else falls back to the
@@ -12899,6 +12904,9 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
 globalThis.HTMLLabelElement = Element;
+for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
+  Object.defineProperty(proto, 'readOnly', { enumerable: true });
+}
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
