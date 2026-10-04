@@ -32,6 +32,8 @@ const __obscuraCore = globalThis.Deno.core;
     '__obscura_liveFrameIds', '__obscura_forgetFrame',
     '__obscura_registerLinkedStylesheet', '__obscura_activateLabel',
     '__obscura_isDisabled', '__obscura_labeledControl', '__obscura_interactiveHost',
+    '__obscura_inputChecked', '__obscura_setInputChecked',
+    '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate',
     '__markParserScripts', '__obscura_hasPendingDynamicScripts',
     '__obscura_hasPendingLoadDelayingScripts', '__obscura_hasPendingParserBlockingScripts',
     '__obscura_nextPendingTimeoutDelay',
@@ -147,12 +149,12 @@ const _DOM_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_attribute", "remove_attribute",
   "set_text_content", "set_inner_html", "set_inner_html_context",
-  "set_fragment_html_executable", "document_write",
+  "set_fragment_html_executable", "document_write", "document_write_close",
 ]);
 const _DOM_TREE_MUTATION_COMMANDS = new Set([
   "append_child", "insert_before", "remove_child",
   "set_inner_html", "set_inner_html_context", "set_fragment_html_executable",
-  "document_write",
+  "document_write", "document_write_close",
 ]);
 // Which realm this bootstrap closure belongs to. Every wrapper's methods come
 // from its own realm's prototypes, so a DOM call names the document it belongs
@@ -162,7 +164,15 @@ const _DOM_TREE_MUTATION_COMMANDS = new Set([
 let _realmFrameId = 0;
 
 const _dom = (cmd, a1, a2) => {
-  const result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
+  let result = __obscuraCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""), _realmFrameId);
+  if (result.startsWith('{"__obscuraFrameRetirements":')) {
+    const mutation = JSON.parse(result);
+    result = mutation.result;
+    for (const [id, nid] of mutation.__obscuraFrameRetirements) {
+      const element = _cache.get(nid);
+      if (element && element._frameId === id) _resetIframeElement(element);
+    }
+  }
   if (_DOM_MUTATION_COMMANDS.has(cmd)) {
     _domMutationEpoch++;
     // Resize observation is tied to rendering-invalidating DOM work. The
@@ -380,7 +390,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await __obscuraCore.ops.op_fetch_url(
-      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", true
+      task.url, "GET", "{}", new Uint8Array(0), task.pageOrigin, "no-cors", "same-origin", "Script"
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -616,7 +626,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   }
   seen.add(url);
   const raw = await __obscuraCore.ops.op_fetch_url(
-    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", true
+    url, "GET", "{}", new Uint8Array(0), pageOrigin, "no-cors", "same-origin", "Stylesheet"
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -793,6 +803,32 @@ function _loadFormState(nid) {
   _formStateLoaded.add(nid);
 }
 
+// Native activation changes checkedness without invoking author-defined IDL
+// accessors. Frameworks may wrap those accessors to track script assignments.
+function _inputChecked(el) {
+  if (_formChecked[el._nid] === undefined) _loadFormState(el._nid);
+  if (_formChecked[el._nid] !== undefined) return _formChecked[el._nid];
+  return el.hasAttribute("checked");
+}
+function _setInputChecked(el, value) {
+  const checked = !!value;
+  _formChecked[el._nid] = checked;
+  _dom("set_form_checked", el._nid, String(checked));
+}
+function _inputIndeterminate(el) {
+  if (_formIndeterminate[el._nid] === undefined) _loadFormState(el._nid);
+  return _formIndeterminate[el._nid] === true;
+}
+function _setInputIndeterminate(el, value) {
+  const indeterminate = !!value;
+  _formIndeterminate[el._nid] = indeterminate;
+  _dom("set_form_indeterminate", el._nid, String(indeterminate));
+}
+globalThis.__obscura_inputChecked = _inputChecked;
+globalThis.__obscura_setInputChecked = _setInputChecked;
+globalThis.__obscura_inputIndeterminate = _inputIndeterminate;
+globalThis.__obscura_setInputIndeterminate = _setInputIndeterminate;
+
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
 // JS \s is wider (U+000B, U+00A0, U+2028, etc.), so it must not be used here.
@@ -968,8 +1004,19 @@ const _scheduleAfter = (delay, fn) => {
     const frameTimerId = -(++_frameTimerSeq);
     const state = { cancelled: false };
     _frameTimerStates.set(frameTimerId, state);
-    __obscuraCore.ops.op_sleep(d).then(() => {
+    __obscuraCore.ops.op_sleep(d, _realmFrameId).then(active => {
       _frameTimerStates.delete(frameTimerId);
+      if (!active || __obscuraCore.ops.op_posted_task_generation(_realmFrameId) < 0) {
+        _frameTimerStates.clear();
+        _timerStates.clear();
+        _nativeTimerIds.clear();
+        _intervals.clear();
+        __obscuraPendingTimeoutDeadlines.clear();
+        _rafPending.clear();
+        _rafFrameScheduled = false;
+        _renderOpportunityScheduled = false;
+        return;
+      }
       if (state.cancelled) return;
       __obscuraCore.ops.op_begin_render_task?.();
       fn();
@@ -1785,14 +1832,33 @@ class CSSStyleDeclaration {
   // Storage is keyed by the dashed CSS name, matching CSSOM. The proxy maps the
   // camelCase IDL access (el.style.fontSize) onto the dashed key (font-size), so
   // getPropertyValue('font-size') and el.style.fontSize stay in sync.
+  // CSSOM: the style attribute is only rewritten when the declaration
+  // changed. Rewriting it on a no-op set queued a mutation record, so a
+  // MutationObserver that re-applies the same style re-triggered itself
+  // forever (a page pinning body `top: 0` spun at 100% CPU).
   setProperty(name, value) {
     this._pull();
     const k = _cssCamelToKebab(String(name));
-    if (value === "" || value == null) delete this._props[k];
-    else this._props[k] = String(value);
+    const old = this._props[k];
+    if (value === "" || value == null) {
+      if (old === undefined) return;
+      delete this._props[k];
+    } else {
+      value = String(value);
+      if (old === value) return;
+      this._props[k] = value;
+    }
     this._push();
   }
-  removeProperty(name) { this._pull(); const k = _cssCamelToKebab(String(name)); const old = this._props[k]; delete this._props[k]; this._push(); return old || ""; }
+  removeProperty(name) {
+    this._pull();
+    const k = _cssCamelToKebab(String(name));
+    const old = this._props[k];
+    if (old === undefined) return "";
+    delete this._props[k];
+    this._push();
+    return old;
+  }
   getPropertyValue(name) { this._pull(); return this._props[_cssCamelToKebab(String(name))] || ""; }
   getPropertyPriority() { return ""; }
   get cssText() { this._pull(); return _serializeCss(this._props); }
@@ -1879,6 +1945,7 @@ function _shallowCloneNode(node) {
 // DOM node.  This is also what makes `new EventTarget()` and subclasses used by
 // framework schedulers work: those targets deliberately have no native node id.
 const _eventTargetListeners = new WeakMap();
+const _eventTargetListenerChanged = new WeakMap();
 function _eventCapture(options) {
   return typeof options === "boolean" ? options : !!(options && options.capture);
 }
@@ -1910,6 +1977,7 @@ function _eventTargetAdd(target, type, callback, options) {
     abortHandler: null,
   };
   listeners.push(entry);
+  _eventTargetListenerChanged.get(target)?.();
   if (signal && typeof signal.addEventListener === "function") {
     entry.abortHandler = () => _eventTargetRemove(target, type, callback, capture);
     signal.addEventListener("abort", entry.abortHandler, { once: true });
@@ -1933,6 +2001,7 @@ function _eventTargetRemove(target, type, callback, options) {
   }
   if (listeners.length === 0) byType.delete(type);
   if (byType.size === 0) _eventTargetListeners.delete(target);
+  _eventTargetListenerChanged.get(target)?.();
 }
 function _eventTargetDispatch(target, event) {
   if (!event || typeof event.type === "undefined") {
@@ -2467,7 +2536,10 @@ class Node {
         "NotFoundError",
       );
     }
-    if (n === ref) return n;
+    if (n === ref) {
+      ref = n.nextSibling;
+      if (!ref) return this.appendChild(n);
+    }
     if (n instanceof DocumentFragment) {
       const children = Array.from(n.childNodes);
       for (const child of children) this.insertBefore(child, ref);
@@ -3071,7 +3143,9 @@ globalThis.__obscura_interactiveHost = function(el) {
 // Frozen so page script can neither replace the helpers to suppress or fake
 // label activation, nor delete them and make later clicks throw.
 for (const _name of ['__obscura_activateLabel', '__obscura_isDisabled',
-                     '__obscura_labeledControl', '__obscura_interactiveHost']) {
+                     '__obscura_labeledControl', '__obscura_interactiveHost',
+                     '__obscura_inputChecked', '__obscura_setInputChecked',
+                     '__obscura_inputIndeterminate', '__obscura_setInputIndeterminate']) {
   Object.defineProperty(globalThis, _name, { writable: false, configurable: false });
 }
 
@@ -4003,6 +4077,12 @@ class Element extends Node {
     // private token so the forwarded events stay trusted. Read from arguments
     // to keep click.length at 0, as in a real browser.
     const _trusted = arguments[0] === _TRUSTED_ACTIVATION;
+    // A borrowed method must activate in the receiver's realm: node ids and
+    // private checkedness are local to each document.
+    if (_cache.get(this._nid) !== this) {
+      const activate = _documentRealmMember(this, 'activateElement');
+      if (activate) return activate.call(this, _trusted);
+    }
     // Pre-click activation steps (HTML spec): a checkbox/radio flips BEFORE the
     // click event dispatches, so listeners observe the new state, and the change
     // is reverted if the event is cancelled. This mirrors the CDP mouse path in
@@ -4019,8 +4099,8 @@ class Element extends Node {
     }
     let _oldChecked = false, _oldIndeterminate = false, _radioStates = null;
     if (_checkable) {
-      _oldChecked = !!this.checked;
-      _oldIndeterminate = !!this.indeterminate;
+      _oldChecked = _inputChecked(this);
+      _oldIndeterminate = _inputIndeterminate(this);
       if (_type === 'radio') {
         const _name = this.getAttribute('name') || '';
         if (_name) {
@@ -4030,29 +4110,29 @@ class Element extends Node {
             const r = _all[i];
             if (((r.getAttribute('type') || '').toLowerCase()) !== 'radio') continue;
             if ((r.getAttribute('name') || '') !== _name || r.form !== this.form) continue;
-            _radioStates.push([r, !!r.checked]);
-            if (r !== this) r.checked = false;
+            _radioStates.push([r, _inputChecked(r)]);
+            if (r !== this) _setInputChecked(r, false);
           }
         }
-        this.checked = true;
+        _setInputChecked(this, true);
       } else {
         // Legacy-pre-activation behaviour (HTML spec): a checkbox toggles its
         // checkedness *and* drops indeterminateness. Clearing it here, not on
         // `change`, is what lets the cancelled-activation path put the old
         // flag back instead of leaving it stuck off.
-        this.checked = !_oldChecked;
-        this.indeterminate = false;
+        _setInputChecked(this, !_oldChecked);
+        _setInputIndeterminate(this, false);
       }
     }
     const _clickEvent = new MouseEvent("click", {bubbles: true, cancelable: true});
     if (_trusted) globalThis.__obscura_markTrusted(_clickEvent);
     const cancelled = !this.dispatchEvent(_clickEvent);
     if (cancelled) {
-      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _radioStates[i][0].checked = _radioStates[i][1]; }
-      else if (_checkable) { this.checked = _oldChecked; this.indeterminate = _oldIndeterminate; }
+      if (_radioStates) { for (let i = 0; i < _radioStates.length; i++) _setInputChecked(_radioStates[i][0], _radioStates[i][1]); }
+      else if (_checkable) { _setInputChecked(this, _oldChecked); _setInputIndeterminate(this, _oldIndeterminate); }
       return;
     }
-    if (_checkable && this.checked !== _oldChecked) {
+    if (_checkable && _inputChecked(this) !== _oldChecked) {
       for (const _type of ['input', 'change']) {
         const _e = new Event(_type, {bubbles: true});
         if (_trusted) globalThis.__obscura_markTrusted(_e);
@@ -4411,27 +4491,20 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    if (_formChecked[this._nid] === undefined) _loadFormState(this._nid);
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
-    return this.hasAttribute("checked");
+    return _inputChecked(this);
   }
   set checked(v) {
-    const checked = !!v;
-    _formChecked[this._nid] = checked;
-    _dom("set_form_checked", this._nid, String(checked));
+    _setInputChecked(this, v);
   }
   // `indeterminate` is IDL-only: it has no content attribute to reflect, so
   // the property itself must exist on the prototype for `'indeterminate' in
   // el` to be true on a freshly created element. Native node-keyed state
   // keeps IDL access and rendering consistent without changing attributes.
   get indeterminate() {
-    if (_formIndeterminate[this._nid] === undefined) _loadFormState(this._nid);
-    return _formIndeterminate[this._nid] === true;
+    return _inputIndeterminate(this);
   }
   set indeterminate(v) {
-    const indeterminate = !!v;
-    _formIndeterminate[this._nid] = indeterminate;
-    _dom("set_form_indeterminate", this._nid, String(indeterminate));
+    _setInputIndeterminate(this, v);
   }
   get selected() {
     if (this._selected !== undefined) return this._selected;
@@ -4592,18 +4665,7 @@ class Element extends Node {
     this.setAttribute("src", v);
   }
   _resetIframeFrame() {
-    const oldId = this._frameId;
-    if (oldId) {
-      delete globalThis.__obscura_frameElements[oldId];
-      delete globalThis.__obscura_frameWindows[oldId];
-      delete globalThis.__obscura_frameObjects[oldId];
-    }
-    this._frameId = 0;
-    this._iframeLoadingUrl = null;
-    this._iframeLoadedUrl = 'about:blank';
-    this._iframeDoc = new _IframeDocument(
-      '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', this);
-    this._iframeWin = new _IframeWindow(this._iframeDoc, 'about:blank');
+    _resetIframeElement(this);
   }
   _loadIframeSrc(url) {
     let fullUrl = url;
@@ -4620,7 +4682,7 @@ class Element extends Node {
     try { pageOrigin = new URL(_domParse('document_url') || 'about:blank').origin; } catch (_) {}
     __obscuraCore.ops.op_fetch_url(
       fullUrl, 'GET', '{}', new Uint8Array(0), pageOrigin,
-      'no-cors', 'same-origin', true
+      'no-cors', 'same-origin', 'Document'
     ).then(raw => {
       if (el._iframeLoadingUrl !== fullUrl) return;
       const response = JSON.parse(raw);
@@ -4635,7 +4697,7 @@ class Element extends Node {
         const box = el.getBoundingClientRect();
         if (el._frameId) globalThis.__obscura_forgetFrame(el._frameId);
         el._frameId = __obscuraCore.ops.op_frame_document_ready(
-          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150);
+          loadedUrl, html, Math.round(box.width) || 300, Math.round(box.height) || 150, el._nid);
         if (el._frameId) globalThis.__obscura_frameElements[el._frameId] = el;
         el._iframeDoc = new _IframeDocument(html, loadedUrl, el);
         el._iframeWin = new _IframeWindow(el._iframeDoc, loadedUrl);
@@ -4915,6 +4977,10 @@ class Element extends Node {
   }
   get offsetParent() {
     if (!this.isConnected || this._renderBoxGeometry() === null) return null;
+    // CSSOM View: null for the root element and the body element. Returning
+    // document.body here made body.offsetParent === body, so the common
+    // `while (el) { x += el.offsetLeft; el = el.offsetParent; }` never ended.
+    if (this === document.documentElement || this === document.body) return null;
     const ownStyle = globalThis.getComputedStyle(this);
     if (ownStyle.position === 'fixed') return null;
 
@@ -5749,7 +5815,11 @@ class Document extends Node {
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
   get ownerDocument() { return null; } // Document has no ownerDocument
-  get compatMode() { return "CSS1Compat"; }
+  get compatMode() {
+    const get = _documentRealmMember(this, 'compatMode');
+    return get ? Reflect.apply(get, this, [])
+      : (this._nid == null ? "CSS1Compat" : _dom("document_compat_mode"));
+  }
   // The document's character encoding, detected from the response charset
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
@@ -6246,50 +6316,14 @@ class Document extends Node {
   // one per attribute, then ">".
   // https://html.spec.whatwg.org/multipage/dynamic-markup-insertion.html#dom-document-write
   write(...args) {
+    const method = _documentRealmMember(this, 'write');
+    if (method) return Reflect.apply(method, this, args);
     var html = args.join('');
     if (!html) return;
-    var body = this.body;
-    if (!body) return;
     // The host parses into the input stream and returns [[parent, node], …], parents first. The
     // insertion stays here, because appendChild does more than append: it reports the
     // mutation, registers window named access, and loads a written stylesheet.
-    var placements = _domParse("document_write", "", html) || [];
-    // The insertion point is the position of the running script. What it writes belongs
-    // behind it, not at the end of the body. The point moves along with every node placed,
-    // even across calls, so that a script's second call lands behind the first instead of
-    // directly behind the script again.
-    var scriptNid = globalThis.__currentScriptNid || 0;
-    var after = null;
-    if (scriptNid) {
-      var anchorNid = this._writeAnchorScript === scriptNid && this._writeAnchorNid
-        ? this._writeAnchorNid
-        : scriptNid;
-      var anchor = _wrap(anchorNid);
-      if (anchor && anchor.parentNode) after = anchor;
-    }
-    for (var i = 0; i < placements.length; i++) {
-      var parentNid = +placements[i][0];
-      var node = _wrap(+placements[i][1]);
-      if (!node) continue;
-      if (node.nodeType === 1 && node.tagName === 'SCRIPT') {
-        __documentWriteScripts.add(node);
-      }
-      if (parentNid) {
-        var parent = _wrap(parentNid);
-        if (parent) parent.appendChild(node);
-        continue;
-      }
-      if (after) {
-        after.parentNode.insertBefore(node, after.nextSibling);
-        after = node;
-      } else {
-        body.appendChild(node);
-      }
-    }
-    if (scriptNid && after) {
-      this._writeAnchorScript = scriptNid;
-      this._writeAnchorNid = after._nid;
-    }
+    _insertWrittenNodes(this, _domParse("document_write", "", html) || []);
   }
   writeln(...args) {
     this.write(args.join('') + '\n');
@@ -6298,10 +6332,10 @@ class Document extends Node {
     const method = _documentRealmMember(this, 'open');
     if (method) return Reflect.apply(method, this, []);
     // Native algorithms use the receiver's tree, not script-overridden getters.
-    const head = _wrapEl(+_dom('query_selector', 'head'));
-    if (head) head.innerHTML = '';
-    const body = _wrapEl(+_dom('query_selector', 'body'));
-    if (body) body.innerHTML = '';
+    for (const nid of _domParse('child_nodes', this._nid) || []) {
+      Node.prototype.removeChild.call(this, _wrap(nid));
+    }
+    this._doctype = undefined;
     // A new parse begins. Whatever the input stream still held is gone.
     _dom("document_write_reset");
     this._writeAnchorScript = 0;
@@ -6317,6 +6351,7 @@ class Document extends Node {
     if (method) return Reflect.apply(method, this, []);
     if (!this._writeOpen) return;
     this._writeOpen = false;
+    _insertWrittenNodes(this, _domParse('document_write_close') || []);
     const generation = this._writeGeneration;
     const finishParsing = () => {
       if (generation !== this._writeGeneration) return;
@@ -6347,6 +6382,46 @@ class Document extends Node {
   }
   hasFocus() { return true; }
   execCommand() { return false; }
+}
+
+// Shared by write and the final EOF flush. A nonnegative parent is a real node,
+// including document node 0; -1 denotes the running script's insertion point.
+function _insertWrittenNodes(doc, placements) {
+  var scriptNid = globalThis.__currentScriptNid || 0;
+  var after = null;
+  if (scriptNid) {
+    var anchorNid = doc._writeAnchorScript === scriptNid && doc._writeAnchorNid
+      ? doc._writeAnchorNid : scriptNid;
+    var anchor = _wrap(anchorNid);
+    if (anchor && anchor.parentNode) after = anchor;
+  }
+  for (var i = 0; i < placements.length; i++) {
+    var parentNid = +placements[i][0];
+    var node = _wrap(+placements[i][1]);
+    if (!node) continue;
+    if (node.nodeType === 10) doc._doctype = undefined;
+    if (node.nodeType === 1 && node.tagName === 'SCRIPT') __documentWriteScripts.add(node);
+    var beforeNid = +placements[i][2];
+    var before = beforeNid >= 0 ? _wrap(beforeNid) : null;
+    // A script can move or remove the parser's insertion anchor between writes.
+    // Use its live parent when present, or append at the normal insertion point.
+    if (before && before.parentNode) {
+      before.parentNode.insertBefore(node, before);
+    } else if (parentNid >= 0) {
+      var parent = _wrap(parentNid);
+      if (parent) parent.appendChild(node);
+    } else if (after) {
+      after.parentNode.insertBefore(node, after.nextSibling);
+      after = node;
+    } else {
+      var body = _wrapEl(+_dom('query_selector', 'body'));
+      if (body) body.appendChild(node);
+    }
+  }
+  if (scriptNid && after) {
+    doc._writeAnchorScript = scriptNid;
+    doc._writeAnchorNid = after._nid;
+  }
 }
 
 // Preserve the receiver realm's implementations even if a membrane remaps the
@@ -7646,19 +7721,26 @@ function _arrayBufferFromBytes(bytes) {
 function _installWasmStreamingFallback() {
   if (typeof WebAssembly === 'undefined') return;
   if (WebAssembly.instantiateStreaming && WebAssembly.instantiateStreaming.__obscuraFallback) return;
-  const nativeInstantiateStreaming = WebAssembly.instantiateStreaming;
-  const fallback = async function instantiateStreaming(source, imports) {
+  // The native streaming entry points call deno_core's isolate-wide wasm
+  // streaming callback, which panics (and, inside a V8 callback, aborts the
+  // process) because no JS handler is registered. Never reach them: read the
+  // Response body and compile it, and reject a non-Response source with a
+  // TypeError as browsers do.
+  const responseBytes = async (source, name) => {
     const response = await source;
-    if (response && typeof response.arrayBuffer === 'function') {
-      return WebAssembly.instantiate(await response.arrayBuffer(), imports);
-    }
-    if (typeof nativeInstantiateStreaming === 'function') {
-      return nativeInstantiateStreaming.call(WebAssembly, response, imports);
-    }
-    return WebAssembly.instantiate(response, imports);
+    if (response && typeof response.arrayBuffer === 'function') return response.arrayBuffer();
+    throw new TypeError(`Failed to execute '${name}' on 'WebAssembly': An argument must be provided, which must be a Response or Promise<Response> object.`);
   };
-  fallback.__obscuraFallback = true;
-  WebAssembly.instantiateStreaming = fallback;
+  const instantiateStreaming = async function instantiateStreaming(source, imports) {
+    return WebAssembly.instantiate(await responseBytes(source, 'instantiateStreaming'), imports);
+  };
+  const compileStreaming = async function compileStreaming(source) {
+    return WebAssembly.compile(await responseBytes(source, 'compileStreaming'));
+  };
+  instantiateStreaming.__obscuraFallback = true;
+  compileStreaming.__obscuraFallback = true;
+  WebAssembly.instantiateStreaming = instantiateStreaming;
+  WebAssembly.compileStreaming = compileStreaming;
 }
 _installWasmStreamingFallback();
 
@@ -7732,7 +7814,7 @@ function _serializeBody(initBody, headers, synthesizeContentType = true) {
   return new TextEncoder().encode(typeof initBody === 'string' ? initBody : String(initBody));
 }
 
-globalThis.fetch = async (input, init = {}) => {
+async function _fetch(input, init = {}, resourceType = "Fetch") {
   init = init || {};
   const request = input instanceof Request ? input : null;
   let url = typeof input === "string"
@@ -7766,7 +7848,7 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, false);
+  const raw = await __obscuraCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, resourceType);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -7782,7 +7864,7 @@ globalThis.fetch = async (input, init = {}) => {
   const responseBody = respType === "opaque"
     ? null
     : (parsed.bodyBase64 ? _base64ToUint8Array(parsed.bodyBase64) : (parsed.body || ""));
-  const response = new Response(responseBody, {
+  const response = _createInternalResponse(responseBody, {
     status: parsed.status,
     statusText: "",
     headers: parsed.headers || {},
@@ -7804,7 +7886,8 @@ globalThis.fetch = async (input, init = {}) => {
     });
   }
   return response;
-};
+}
+globalThis.fetch = (input, init = {}) => _fetch(input, init);
 
 if (typeof Headers === "undefined") {
   globalThis.Headers = class Headers {
@@ -7935,13 +8018,13 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
     // Same rule as fetch: always resolve through the URL parser.
     let url = _resolveUrl(this._url);
 
-    fetch(url, {
+    _fetch(url, {
       method: this._method,
       headers: this._headers,
       body: body || undefined,
       mode: 'cors',
       credentials: this.withCredentials ? 'include' : 'same-origin',
-    }).then(async (resp) => {
+    }, 'XHR').then(async (resp) => {
       if (xhr._aborted) return;
 
       xhr.status = resp.status;
@@ -8235,13 +8318,36 @@ function _decodeBodyWithCharset(bytes, headers) {
   catch (e) { return new TextDecoder().decode(bytes); }
 }
 
+let _createInternalResponse;
 if (typeof Response === 'undefined') {
-  globalThis.Response = class Response {
-    constructor(body, init = {}) {
-      this._bodyBytes = _bodyToUint8Array(body); this.status = init.status === undefined ? 200 : Number(init.status); this.statusText = init.statusText || '';
+  const internalResponseInit = {};
+  const _Response = globalThis.Response = class Response {
+    constructor(body, init = {}, internalInit) {
+      if (init == null) init = {};
+      if (typeof init !== 'object' && typeof init !== 'function') {
+        throw new TypeError('Response init must be a dictionary');
+      }
+      const internal = internalInit === internalResponseInit;
+      const headers = init.headers;
+      const status = init.status;
+      const statusText = init.statusText;
+      this.status = status === undefined ? 200 : (internal ? status : (+status & 0xffff));
+      this.statusText = statusText === undefined ? '' : `${statusText}`;
+      if (!internal) {
+        if (this.status < 200 || this.status > 599) throw new RangeError('Invalid response status');
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(this.statusText)) throw new TypeError('Invalid response statusText');
+        if (body != null && (this.status === 204 || this.status === 205 || this.status === 304)) {
+          throw new TypeError('Response status cannot have a body');
+        }
+      } else if (this.status === 204 || this.status === 205 || this.status === 304) {
+        body = null;
+      }
+      this._bodyBytes = _bodyToUint8Array(body);
       this.ok = this.status >= 200 && this.status < 300;
-      this.headers = new Headers(init.headers);
-      this.type = init.type || 'basic'; this.url = init.url || ''; this.redirected = !!init.redirected;
+      this.headers = new Headers(headers);
+      this.type = internal ? (init.type || 'default') : 'default';
+      this.url = internal ? (init.url || '') : '';
+      this.redirected = internal && !!init.redirected;
       // #818: body/bodyUsed. A null-body response (null or no body passed)
       // has body === null; every other body is a one-chunk stream, created
       // lazily so merely touching .body does not copy the bytes.
@@ -8297,7 +8403,7 @@ if (typeof Response === 'undefined') {
     async arrayBuffer() { this._consumeBody(); return _arrayBufferFromBytes(this._fetchBody ? await this._fetchBody.promise : this._bodyBytes); }
     async blob() { this._consumeBody(); return new Blob([this._fetchBody ? await this._fetchBody.promise : this._bodyBytes]); }
     clone() {
-      const copy = new Response(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
+      const copy = _createInternalResponse(this._bodyNull ? null : this._bodyBytes, { status: this.status, statusText: this.statusText, headers: this.headers, type: this.type, url: this.url, redirected: this.redirected });
       if (this._fetchBody) {
         const promise = this._fetchBody.promise.then(bytes => bytes.slice());
         promise.catch(() => {});
@@ -8306,10 +8412,25 @@ if (typeof Response === 'undefined') {
       }
       return copy;
     }
-    static error() { return new Response(null, { status: 0 }); }
-    static redirect(url, status) { return new Response(null, { status: status || 302, headers: { Location: url } }); }
-    static json(data, init) { return new Response(JSON.stringify(data), { ...init, headers: { 'content-type': 'application/json', ...(init?.headers || {}) } }); }
+    static error() { return _createInternalResponse(null, { status: 0, type: 'error' }); }
+    static redirect(url, status = 302) {
+      url = `${url}`;
+      status = +status & 0xffff;
+      const parsed = new URL(url, document.baseURI);
+      if (![301,302,303,307,308].includes(status)) throw new RangeError('Invalid redirect status');
+      return new Response(null, { status, headers: { Location: parsed.href } });
+    }
+    static json(data, init) {
+      const json = JSON.stringify(data);
+      if (json === undefined) throw new TypeError('Value is not JSON serializable');
+      const response = new Response(new TextEncoder().encode(json), init);
+      if (!response.headers.has('content-type')) response.headers.set('content-type', 'application/json');
+      return response;
+    }
   };
+  _createInternalResponse = (body, init) => new _Response(body, init, internalResponseInit);
+} else {
+  _createInternalResponse = (body, init) => new Response(body, init);
 }
 
 if (!Element.prototype.replaceWith) {
@@ -8884,7 +9005,7 @@ function _evaluateMediaFeature(raw) {
   match = feature.match(/^prefers-color-scheme\s*:\s*(dark|light|no-preference)$/);
   if (match) return match[1] === 'light';
   match = feature.match(/^prefers-reduced-motion\s*:\s*(reduce|no-preference)$/);
-  if (match) return match[1] === 'no-preference';
+  if (match) return match[1] === (globalThis.__obscura_reduced_motion ? 'reduce' : 'no-preference');
 
   match = feature.match(/^(pointer|any-pointer)\s*:\s*(none|coarse|fine)$/);
   if (match) return match[2] === 'fine';
@@ -8939,17 +9060,31 @@ function _evaluateMediaQueryList(query) {
 
 globalThis.matchMedia = _markNative(function matchMedia(q) {
   const media = q == null ? '' : String(q);
-  return {
-    get matches() { return _evaluateMediaQueryList(media); },
-    media,
-    onchange: null,
-    addListener(){},
-    removeListener(){},
-    addEventListener(){},
-    removeEventListener(){},
-    dispatchEvent(){return true;}
-  };
+  return new MediaQueryList(_mediaQueryToken, media);
 });
+const _mediaQueryToken = {};
+const _mediaQueries = new Set();
+// A document keeps query lists with change listeners alive even when author
+// code does not retain the object returned from matchMedia().
+const _activeMediaQueries = new Set();
+const _mediaQueryState = new WeakMap();
+globalThis.__obscura_recompute_media_queries = () => {
+  // Media/viewport changes also invalidate live computed-style snapshots.
+  // Keep the epoch in this private scope, not in host-injected page script.
+  _domMutationEpoch++;
+  for (const ref of _mediaQueries) {
+    const query = ref.deref();
+    if (!query) { _mediaQueries.delete(ref); continue; }
+    const state = _mediaQueryState.get(query);
+    const matches = query.matches;
+    if (matches === state.matches) continue;
+    state.matches = matches;
+    // Capture the value at this rendering change, not at eventual delivery.
+    setTimeout(() => query.dispatchEvent(new MediaQueryListEvent('change', {
+      matches, media: query.media,
+    })), 0);
+  }
+};
 // getComputedStyle() returns a fresh declaration object, but those objects all
 // observe the same computed style until the document or viewport changes.
 // Share the immutable native snapshot behind them. Frameworks routinely call
@@ -10642,6 +10777,19 @@ globalThis.KeyboardEvent = class extends Event {
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
+const _browserErrorEvent = globalThis.ErrorEvent;
+__obscuraCore.setReportExceptionCallback(error => {
+  // deno_core's default reporter terminates execution, discarding the rest of
+  // the microtask checkpoint. Browser callback errors must leave queued work live.
+  let message;
+  try { message = String(error?.message ?? error); }
+  catch (_) { message = "Uncaught exception"; }
+  const event = new _browserErrorEvent("error", { message, error, cancelable: true });
+  if (_eventTargetDispatch(globalThis, event)) {
+    __obscuraCore.ops.op_report_browser_exception(error, globalThis.__obscura_frameId || 0);
+    _consoleFn("error", [error]);
+  }
+});
 globalThis.PointerEvent = class extends MouseEvent {
   constructor(t,o={}) {
     super(t,o);
@@ -12704,7 +12852,10 @@ globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
 globalThis.HTMLImageElement = HTMLImageElement;
-globalThis.HTMLInputElement = class HTMLInputElement extends Element {};
+globalThis.HTMLInputElement = class HTMLInputElement extends Element {
+  get readOnly() { return this.hasAttribute('readonly'); }
+  set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+};
 // Framework value trackers read own prototype descriptors, not inherited ones.
 Object.defineProperties(HTMLInputElement.prototype, {
   value: Object.getOwnPropertyDescriptor(Element.prototype, 'value'),
@@ -12735,6 +12886,8 @@ globalThis.HTMLFormElement = class HTMLFormElement extends Element {
 };
 globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
+  get readOnly() { return this.hasAttribute('readonly'); }
+  set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
   // `rows`/`cols` reflect the content attributes and drive the control's
   // intrinsic box (the renderer sizes a textarea from them). The attributes
   // are limited to positive non-zero numbers; anything else falls back to the
@@ -12752,6 +12905,9 @@ globalThis.HTMLTextAreaElement = class HTMLTextAreaElement extends Element {
   set cols(v) { this.setAttribute('cols', String(v)); }
 };
 globalThis.HTMLLabelElement = Element;
+for (const proto of [HTMLInputElement.prototype, HTMLTextAreaElement.prototype]) {
+  Object.defineProperty(proto, 'readOnly', { enumerable: true });
+}
 globalThis.HTMLTableElement = Element;
 globalThis.HTMLIFrameElement = Element;
 globalThis.HTMLCanvasElement = Element;
@@ -13160,9 +13316,9 @@ function _nodeList(els) {
 // small legacy set of HTML elements, as properties of the WindowProxy. V8's
 // global object cannot be replaced with a WindowProxy after snapshot startup,
 // so install lazy accessors for the supported names present in this document.
-// The accessor resolves against the live tree: one match returns that element
-// (or an iframe's Window), while duplicates return a live-shaped
-// HTMLCollection in tree order.
+// The accessor resolves against the live tree: named child contexts take
+// priority, otherwise one match returns its element and duplicate elements
+// return a live-shaped HTMLCollection in tree order.
 const _windowNamedPropertyNames = new Set();
 const _windowNamedNameTags = new Set(["embed", "form", "iframe", "img", "object"]);
 
@@ -13205,11 +13361,15 @@ function _windowNamedCandidates(name) {
 function _windowNamedValue(name) {
   const matches = _windowNamedCandidates(name);
   if (matches.length === 0) return undefined;
+  for (const element of matches) {
+    if (element.localName === "iframe" && _windowNameEligibleElement(element)
+        && element.getAttribute("name") === name) {
+      const window = element.contentWindow;
+      if (window) return window;
+    }
+  }
   if (matches.length > 1) return HTMLCollection._from(matches);
-  const element = matches[0];
-  return element.localName === "iframe" && element.contentWindow
-    ? element.contentWindow
-    : element;
+  return matches[0];
 }
 
 function _ensureWindowNamedProperty(name) {
@@ -13852,6 +14012,7 @@ globalThis.__obscura_liveFrameIds = function () {
 // place, so a registry added later cannot be missed by the discard path: any
 // surviving reference keeps the frame's context and DOM tree alive.
 globalThis.__obscura_forgetFrame = function (frameId) {
+  _dom('retire_frame', frameId);
   delete globalThis.__obscura_frameElements[frameId];
   delete globalThis.__obscura_frameObjects[frameId];
   delete globalThis.__obscura_frameWindows[frameId];
@@ -13950,7 +14111,7 @@ function _ensureInitialFrameRealm(element) {
     globalThis.__obscura_frameObjects[id] = {
       window: child, document: child.document, initial: true,
     };
-  });
+  }, element._nid);
   if (frameId) {
     element._frameId = frameId;
     element._iframeWin = globalThis.__obscura_frameObjects[frameId].window;
@@ -13958,6 +14119,16 @@ function _ensureInitialFrameRealm(element) {
     globalThis.__obscura_frameElements[frameId] = element;
   }
   return frameId !== 0;
+}
+
+function _resetIframeElement(element) {
+  if (element._frameId) globalThis.__obscura_forgetFrame(element._frameId);
+  element._frameId = 0;
+  element._iframeLoadingUrl = null;
+  element._iframeLoadedUrl = 'about:blank';
+  element._iframeDoc = new _IframeDocument(
+    '<!DOCTYPE html><html><head></head><body></body></html>', 'about:blank', element);
+  element._iframeWin = new _IframeWindow(element._iframeDoc, 'about:blank');
 }
 
 // The window object this realm uses to stand for frame `frameId`, built once
@@ -16156,12 +16327,49 @@ if (typeof BroadcastChannel === 'undefined') {
   Object.setPrototypeOf(globalThis.BroadcastChannel.prototype, globalThis.EventTarget.prototype);
 }
 
-if (typeof MediaQueryList === 'undefined') {
-  globalThis.MediaQueryList = class MediaQueryList {
-    constructor(q) { this.media = q || ''; this.matches = false; }
-    addListener() {} removeListener() {} addEventListener() {} removeEventListener() {}
-  };
-}
+globalThis.MediaQueryListEvent = class MediaQueryListEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    Object.defineProperties(this, {
+      matches: { value: !!init.matches, enumerable: true },
+      media: { value: String(init.media ?? ''), enumerable: true },
+    });
+  }
+};
+globalThis.MediaQueryList = class MediaQueryList {
+  constructor(token, media) {
+    if (token !== _mediaQueryToken) throw new TypeError('Illegal constructor');
+    _mediaQueryState.set(this, { media, matches: _evaluateMediaQueryList(media), onchange: null });
+    _mediaQueries.add(new WeakRef(this));
+    _eventTargetListenerChanged.set(this, () => {
+      if (_eventTargetListeners.get(this)?.get('change')?.length) _activeMediaQueries.add(this);
+      else _activeMediaQueries.delete(this);
+    });
+  }
+  get media() { return _mediaQueryState.get(this).media; }
+  get matches() { return _evaluateMediaQueryList(this.media); }
+  get onchange() { return _mediaQueryState.get(this).onchange; }
+  set onchange(value) {
+    const state = _mediaQueryState.get(this);
+    state.onchange = typeof value === 'function' ? value : null;
+    // The event-handler slot is independent of an explicitly registered
+    // callback, and replacing its value preserves its position in the list.
+    if (state.onchange && !state.onchangeListener) {
+      state.onchangeListener = event => state.onchange?.call(this, event);
+      this.addEventListener('change', state.onchangeListener);
+    } else if (!state.onchange && state.onchangeListener) {
+      this.removeEventListener('change', state.onchangeListener);
+      state.onchangeListener = null;
+    }
+  }
+  addListener(callback) { this.addEventListener('change', callback); }
+  removeListener(callback) { this.removeEventListener('change', callback); }
+  addEventListener(type, callback, options) { _eventTargetAdd(this, type, callback, options); }
+  removeEventListener(type, callback, options) { _eventTargetRemove(this, type, callback, options); }
+  dispatchEvent(event) { return _eventTargetDispatch(this, event); }
+  get [Symbol.toStringTag]() { return 'MediaQueryList'; }
+};
+Object.setPrototypeOf(MediaQueryList.prototype, EventTarget.prototype);
 
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
@@ -16691,17 +16899,130 @@ if (typeof ShadowRoot !== 'undefined' && !ShadowRoot.prototype.elementFromPoint)
   };
 }
 
-// Capture late-defined document members too, before page code can replace them.
-const _documentMembers = Object.freeze(Object.fromEntries(
-  ['URL', 'defaultView', 'readyState', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'close', 'elementFromPoint'].map(name => {
+// Ops are bound after snapshot restoration, so probe the renderer at realm
+// initialization, not while building the snapshot with an empty op table.
+function _installCaretGeometry() {
+  if (typeof __obscuraCore.ops.op_layout_caret !== 'function') return {};
+  const positions = new WeakMap();
+  function positionState(receiver) {
+    const state = positions.get(receiver);
+    if (!state) throw new TypeError('Illegal invocation');
+    return state;
+  }
+  const CaretPosition = class CaretPosition {
+    constructor() { throw new TypeError('Illegal constructor'); }
+    get offsetNode() { return positionState(this).node; }
+    get offset() { return positionState(this).offset; }
+    getClientRect() {
+      const { node, offset } = positionState(this);
+      const raw = __obscuraCore.ops.op_layout_caret_rect(String(node._nid), offset, _realmFrameId);
+      const rect = raw ? JSON.parse(raw) : null;
+      return rect ? new DOMRect(rect.x, rect.y, rect.width, rect.height) : new DOMRect();
+    }
+  };
+  Object.defineProperty(globalThis, 'CaretPosition', {
+    value: CaretPosition, writable: true, configurable: true,
+  });
+  Object.defineProperty(CaretPosition.prototype, Symbol.toStringTag, { value: 'CaretPosition', configurable: true });
+  for (const name of ['offsetNode', 'offset', 'getClientRect']) {
+    const descriptor = Object.getOwnPropertyDescriptor(CaretPosition.prototype, name);
+    descriptor.enumerable = true;
+    Object.defineProperty(CaretPosition.prototype, name, descriptor);
+    _markNative(descriptor.value || descriptor.get);
+  }
+  _markNative(CaretPosition);
+  function nativeCaret(receiver, x, y) {
+    if (receiver !== globalThis.document && !(receiver instanceof Document)) throw new TypeError('Illegal invocation');
+    if (receiver._nid !== globalThis.document?._nid) return null;
+    const raw = __obscuraCore.ops.op_layout_caret(x, y, _realmFrameId);
+    if (!raw) return null;
+    const [nid, offset] = JSON.parse(raw);
+    const node = _wrap(nid);
+    return node ? { node, offset } : null;
+  }
+  Document.prototype.caretRangeFromPoint = function caretRangeFromPoint(x = 0, y = 0) {
+    const method = _documentRealmMember(this, 'caretRangeFromPoint');
+    if (method) return Reflect.apply(method, this, [x, y]);
+    // The legacy Chromium extension takes optional signed integer coordinates.
+    const state = nativeCaret(this, +x | 0, +y | 0);
+    if (!state) return null;
+    const range = new Range();
+    // Widget value offsets are not DOM Range boundaries. The legacy API
+    // exposes the position before the control, not its internal editing text.
+    for (let node = state.node; node; node = node.parentNode) {
+      if (node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) {
+        range.setStartBefore(node);
+        range.collapse(true);
+        return range;
+      }
+    }
+    range.setStart(state.node, state.offset);
+    range.collapse(true);
+    return range;
+  };
+  Document.prototype.caretPositionFromPoint = function caretPositionFromPoint(x, y, options = {}) {
+    const method = _documentRealmMember(this, 'caretPositionFromPoint');
+    if (method) return Reflect.apply(method, this, arguments);
+    if (arguments.length < 2) throw new TypeError('Two coordinates are required');
+    x = +x; y = +y;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new TypeError('Coordinates must be finite');
+    if (options != null && typeof options !== 'object' && typeof options !== 'function') {
+      throw new TypeError('Options must be a dictionary');
+    }
+    const shadowRoots = options?.shadowRoots;
+    if (shadowRoots !== undefined && (shadowRoots == null || typeof shadowRoots[Symbol.iterator] !== 'function')) {
+      throw new TypeError('Shadow roots must be iterable');
+    }
+    const roots = shadowRoots === undefined ? [] : Array.from(shadowRoots);
+    for (const root of roots) {
+      if (!(root instanceof ShadowRoot)) throw new TypeError('Expected a ShadowRoot');
+    }
+    const state = nativeCaret(this, x, y);
+    if (!state) return null;
+    let root = state.node.getRootNode();
+    while (root instanceof ShadowRoot && !roots.some(allowed => {
+      for (let current = allowed; current instanceof ShadowRoot; current = current.host.getRootNode()) {
+        if (current === root) return true;
+      }
+      return false;
+    })) {
+      const host = root.host, parent = host.parentNode;
+      if (!parent) return null;
+      state.offset = Array.prototype.indexOf.call(parent.childNodes, host);
+      state.node = parent;
+      root = parent.getRootNode();
+    }
+    const position = Object.create(CaretPosition.prototype);
+    positions.set(position, state);
+    return position;
+  };
+  _markNative(Document.prototype.caretRangeFromPoint);
+  _markNative(Document.prototype.caretPositionFromPoint);
+  return {
+    caretRangeFromPoint: Document.prototype.caretRangeFromPoint,
+    caretPositionFromPoint: Document.prototype.caretPositionFromPoint,
+  };
+}
+
+// Capture late-defined members too, before page code can replace them.
+const _nativeElementClick = Element.prototype.click;
+const _documentMembers = Object.freeze(Object.fromEntries([
+  ...['URL', 'defaultView', 'readyState', 'compatMode', 'getElementById', 'querySelector', 'querySelectorAll', 'open', 'write', 'close', 'elementFromPoint'].map(name => {
     const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, name);
     return [name, descriptor.value || descriptor.get];
-  })));
+  }),
+  ['activateElement', function(trusted) {
+    return _nativeElementClick.call(this, trusted ? _TRUSTED_ACTIVATION : undefined);
+  }],
+]));
 
 globalThis.__obscura_init = function() {
   // The host sets __obscura_frameId on a frame realm before calling this.
   _realmFrameId = globalThis.__obscura_frameId >>> 0;
-  __obscuraCore.ops.op_register_document_realm(_documentMembers, _realmFrameId);
+  const caretMembers = _installCaretGeometry();
+  __obscuraCore.ops.op_register_document_realm(
+    Object.keys(caretMembers).length ? Object.freeze({ ..._documentMembers, ...caretMembers }) : _documentMembers,
+    _realmFrameId);
   _browserPostedTaskWakePending = false;
   for (const queue of _browserPostedTaskQueues) _browserPostedTaskDiscardQueue(queue);
   _fpSeed = Date.now() ^ (Math.random() * 0xFFFFFFFF >>> 0);
