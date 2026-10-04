@@ -1625,6 +1625,64 @@ impl PreparedRender {
         best.map(|(_, _, _, _, id)| id)
     }
 
+    /// Shaped-text caret in the viewport. Hit testing selects the painted
+    /// owner first, so an occluding sibling cannot donate its text cursor.
+    pub fn caret_from_point(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        x: f32,
+        y: f32,
+    ) -> Option<(obscura_dom::tree::NodeId, usize)> {
+        let hit = self.hit_test(tree, scroll, x, y)?;
+        for parent in std::iter::successors(Some(hit), |id| crate::dom::rendered_parent(tree, *id))
+            .take(tree.len() + 1)
+        {
+            let movement = scroll.movement_for(parent);
+            let transform = self.layout.transforms.get(&parent).copied().unwrap_or_default();
+            let Some(inverse) = transform.inverse() else { continue; };
+            let (local_x, local_y) = inverse.map_point(x - movement.0, y - movement.1);
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            let best = indices.filter_map(|index|
+                self.layout.text_engine.caret_from_point(index, parent, tree,
+                    &self.layout.styles, local_x, local_y, hit))
+                .min_by(|a, b| a.2.total_cmp(&b.2));
+            if let Some((node, offset, _)) = best { return Some((node, offset)); }
+        }
+        // Empty rendered line boxes have an element boundary, not a fabricated
+        // text node. This also preserves the caret of an empty editable block.
+        Some((hit, 0))
+    }
+
+    /// Geometry for a previously obtained DOM caret, using current layout and
+    /// scroll rather than the snapshot at the original mouse coordinates.
+    pub fn caret_rect(
+        &self,
+        tree: &DomTree,
+        scroll: &ResolvedScrollState,
+        node: obscura_dom::tree::NodeId,
+        offset: usize,
+    ) -> Option<crate::Rect> {
+        for parent in std::iter::successors(crate::dom::rendered_parent(tree, node),
+            |id| crate::dom::rendered_parent(tree, *id)).take(tree.len() + 1)
+        {
+            let indices = self.layout.ifc_items.get(&parent).into_iter().copied()
+                .chain(self.layout.run_ifc_items.get(&parent).into_iter().flatten().copied());
+            for index in indices {
+                let Some(rect) = self.layout.text_engine.caret_rect(index, parent,
+                    tree, &self.layout.styles, node, offset) else { continue; };
+                let mut rect = self.layout.transforms.get(&parent).copied()
+                    .unwrap_or_default().map_rect(rect);
+                let movement = scroll.movement_for(parent);
+                rect.x += movement.0;
+                rect.y += movement.1;
+                return Some(rect);
+            }
+        }
+        None
+    }
+
     /// A compact CSSOM snapshot derived from the same final cascade and
     /// layout used by paint and geometry. Keeping this on `PreparedRender`
     /// lets script fetch all high-traffic computed properties in one op,
@@ -12025,6 +12083,38 @@ mod tests {
                 assert_eq!(prepared.hit_test(&tree, &scroll, x, y), Some(expected),
                     "{placement}, point ({x}, {y})");
             }
+        }
+    }
+
+    #[test]
+    fn absolute_inline_control_preserves_static_position_and_hit_target() {
+        for (name, display, children, input_rules, x, y) in [
+            ("before inline", "block", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+            ("after inline", "block", "<label for='control'></label><input id='control' type='checkbox'>", "", 32.0, 0.0),
+            ("between inlines", "block", "<label for='control'></label><input id='control' type='checkbox'><label for='control'></label>", "", 32.0, 0.0),
+            ("after block", "block", "<div style='height:16px'></div><input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 16.0),
+            ("explicit insets", "block", "<input id='control' type='checkbox'><label for='control'></label>", "top:0;left:0", 0.0, 0.0),
+            ("authored block", "block", "<input id='control' type='checkbox'><label for='control'></label>", "display:block", 0.0, 0.0),
+            ("flex control", "flex", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+            ("grid control", "grid", "<input id='control' type='checkbox'><label for='control'></label>", "", 0.0, 0.0),
+        ] {
+            let tree = parse_html(&format!(r#"<!doctype html><style>
+                html,body {{margin:0}}
+                #switch {{position:relative;width:80px;height:48px;display:{display};line-height:1}}
+                input {{position:absolute;width:32px;height:16px;opacity:0;z-index:-1000;margin:0;{input_rules}}}
+                label {{display:inline-block;box-sizing:border-box;width:32px;height:16px;border:1px solid}}
+                </style><div id="switch">{children}</div>"#));
+            let mut cache = RenderResourceCache::default();
+            let prepared = prepare_dom(&tree, (800.0, 600.0), None, &mut cache).unwrap();
+            let scroll = prepared.resolve_scroll_state(&tree, (0.0, 0.0), &HashMap::new());
+            let label = tree.query_selector("label").unwrap().unwrap();
+            let input = tree.get_element_by_id("control").unwrap();
+            assert_eq!(prepared.layout.rects[&label].height, 16.0);
+            assert_eq!(prepared.layout.rects[&input].height, 16.0);
+            assert_eq!(prepared.layout.rects[&input].x, x, "{name}");
+            assert_eq!(prepared.layout.rects[&input].y, y, "{name}");
+            let rect = prepared.layout.rects[&label];
+            assert_eq!(prepared.hit_test(&tree, &scroll, rect.x + 16.0, rect.y + 8.0), Some(label), "{name}");
         }
     }
 
