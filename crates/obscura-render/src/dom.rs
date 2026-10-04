@@ -2119,6 +2119,9 @@ struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
     runs: HashMap<NodeId, Vec<usize>>,
     word_items: HashMap<NodeId, Vec<usize>>,
+    /// Zero-sized inline placeholders retain out-of-flow source positions
+    /// without changing the real box's percentage containing block.
+    static_positions: HashMap<NodeId, taffy::NodeId>,
     generated: Vec<GeneratedBoxBuild>,
     /// Specified column widths per table grid node, from `<col>` elements and
     /// colspan-1 cells: `(px, percent)` per column index. Consumed by the
@@ -6841,6 +6844,7 @@ fn layout_dom_once(
                 initial_containing_block,
                 &id_map,
                 &styles,
+                &ifc_items.static_positions,
             );
             let available = taffy::Size {
                 width: taffy::AvailableSpace::Definite(initial_cb_width),
@@ -8828,6 +8832,7 @@ fn compute_absolute_rects(
 struct StaticPositionCandidate {
     child: taffy::NodeId,
     target: taffy::NodeId,
+    placeholder: Option<taffy::NodeId>,
     inline_axis: bool,
     block_axis: bool,
 }
@@ -8847,6 +8852,7 @@ fn reparent_inset_positioned_nodes(
     taffy_root: taffy::NodeId,
     id_map: &HashMap<taffy::NodeId, NodeId>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
+    static_positions: &HashMap<NodeId, taffy::NodeId>,
 ) -> Vec<StaticPositionCandidate> {
     let reverse: HashMap<NodeId, taffy::NodeId> = id_map
         .iter()
@@ -8903,13 +8909,15 @@ fn reparent_inset_positioned_nodes(
         let Some(current) = taffy_tree.parent(child) else {
             continue;
         };
-        if current == target {
+        let placeholder = static_positions.get(&dom_id).copied();
+        if current == target && placeholder.is_none() {
             continue;
         }
         if !has_block_inset || !has_inline_inset {
             static_candidates.push(StaticPositionCandidate {
                 child,
                 target,
+                placeholder,
                 inline_axis: !has_inline_inset,
                 block_axis: !has_block_inset,
             });
@@ -9660,7 +9668,9 @@ fn resolve_static_positions_and_reparent(
     // coordinates.
     let mut resolved = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let Some(child_origin) = taffy_global_origin(taffy_tree, candidate.child) else {
+        let Some(child_origin) = taffy_global_origin(
+            taffy_tree, candidate.placeholder.unwrap_or(candidate.child),
+        ) else {
             continue;
         };
         let Some(target_origin) = taffy_global_origin(taffy_tree, candidate.target) else {
@@ -9669,7 +9679,11 @@ fn resolve_static_positions_and_reparent(
         let Ok(child_layout) = taffy_tree.layout(candidate.child) else {
             continue;
         };
-        let child_margin = child_layout.margin;
+        let child_margin = if candidate.placeholder.is_some() {
+            taffy::Rect::ZERO
+        } else {
+            child_layout.margin
+        };
         let Ok(target_layout) = taffy_tree.layout(candidate.target) else {
             continue;
         };
@@ -13571,9 +13585,9 @@ fn inline_wrapper_float(
 ///   word: faster and lighter than the old whole-container promotion). Runs
 ///   holding atomic inline boxes (img, inline-block, ...) fall back to an
 ///   anonymous flex-wrap wrapper around the run's boxes;
-/// - out-of-flow (absolutely positioned) children neither join nor break a
-///   run; they are appended after the flow children so their containing
-///   block is this parent, whose used width they resolve percentages against.
+/// - out-of-flow children do not break a run. Inline static-position markers
+///   retain their source position, while the real boxes remain direct children
+///   of this parent so percentages resolve against its containing block.
 #[allow(clippy::too_many_arguments)]
 fn build_mixed_block(
     tree: &DomTree,
@@ -13602,9 +13616,11 @@ fn build_mixed_block(
     enum Seg {
         Run(Vec<NodeId>),
         Block(NodeId),
+        OutOfFlow(NodeId),
     }
     let mut segs: Vec<Seg> = Vec::new();
     let mut out_of_flow: Vec<NodeId> = Vec::new();
+    let mut run_index = None;
     for &cid in &flat {
         let Some(node) = tree.borrow_node(cid) else {
             continue;
@@ -13625,22 +13641,36 @@ fn build_mixed_block(
                 continue;
             }
             if matches!(s.position, Some(taffy::Position::Absolute)) {
-                out_of_flow.push(cid);
-                continue;
+                if s.static_position_inline &&
+                    ((s.inset[0].is_none() && s.inset[2].is_none()) ||
+                     (s.inset[1].is_none() && s.inset[3].is_none()))
+                {
+                    out_of_flow.push(cid);
+                    true
+                } else {
+                    segs.push(Seg::OutOfFlow(cid));
+                    continue;
+                }
+            } else {
+                let is_forced_break = node
+                    .as_element()
+                    .map_or(false, |element| element.local.as_ref() == "br");
+                is_forced_break || crate::is_inline_level_box(s)
             }
-            let is_forced_break = node
-                .as_element()
-                .map_or(false, |element| element.local.as_ref() == "br");
-            is_forced_break || crate::is_inline_level_box(s)
         } else {
             false
         };
         if inline_level {
-            match segs.last_mut() {
-                Some(Seg::Run(run)) => run.push(cid),
-                _ => segs.push(Seg::Run(vec![cid])),
+            if let Some(index) = run_index {
+                if let Seg::Run(run) = &mut segs[index] {
+                    run.push(cid);
+                }
+            } else {
+                run_index = Some(segs.len());
+                segs.push(Seg::Run(vec![cid]));
             }
         } else {
+            run_index = None;
             segs.push(Seg::Block(cid));
         }
     }
@@ -13671,13 +13701,19 @@ fn build_mixed_block(
     let mut before_pending = !before_block && !before_leaves.is_empty();
     let mut after_pending = !after_block && !after_leaves.is_empty();
 
-    let n_segs = segs.len();
+    let first_flow = segs.iter().position(|seg| !matches!(seg, Seg::OutOfFlow(_)));
+    let last_flow = segs.iter().rposition(|seg| !matches!(seg, Seg::OutOfFlow(_)));
     let mut child_ids: Vec<taffy::NodeId> = Vec::new();
     if before_block {
         child_ids.extend(before_leaves.iter().copied());
     }
     for (i, seg) in segs.into_iter().enumerate() {
         match seg {
+            Seg::OutOfFlow(cid) => {
+                child_ids.extend(build_any(
+                    tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
+                ));
+            }
             Seg::Block(cid) => {
                 let built = build_any(
                     tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
@@ -13728,8 +13764,8 @@ fn build_mixed_block(
                     .map(|index| index + 1)
                     .unwrap_or(start);
                 let run = &run[start..end];
-                let join_before = before_pending && i == 0;
-                let join_after = after_pending && i + 1 == n_segs;
+                let join_before = before_pending && Some(i) == first_flow;
+                let join_after = after_pending && Some(i) == last_flow;
                 // Fast path: the whole run folds to one shaped leaf, unless
                 // pseudo-content word leaves must share its lines.
                 if !join_before && !join_after {
@@ -13748,6 +13784,21 @@ fn build_mixed_block(
                     before_pending = false;
                 }
                 for &rc in run {
+                    if styles.get(&rc).is_some_and(|s| {
+                        matches!(s.position, Some(taffy::Position::Absolute))
+                    }) {
+                        let placeholder = taffy_tree.new_leaf(taffy::Style {
+                            size: taffy::Size {
+                                width: taffy::Dimension::length(0.0),
+                                height: taffy::Dimension::length(0.0),
+                            },
+                            flex_shrink: 0.0,
+                            ..Default::default()
+                        }).ok()?;
+                        ifc_items.static_positions.insert(rc, placeholder);
+                        atoms.push(placeholder);
+                        continue;
+                    }
                     let is_forced_break = tree.borrow_node(rc).is_some_and(|node| {
                         node.as_element()
                             .is_some_and(|element| element.local.as_ref() == "br")
