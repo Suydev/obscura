@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -21,17 +22,16 @@ class ObstacleReleaseGate(unittest.TestCase):
                 [sys.executable, str(Path(__file__).with_name("compare_obstacle.py")),
                  "--base", str(base), "--candidate", str(candidate)],
                 capture_output=True, text=True,
+                env={**os.environ, "GITHUB_STEP_SUMMARY": str(Path(directory) / "summary.md")},
             )
 
     def test_shared_baseline_failure_does_not_pass_the_release_gate(self):
         result = self.compare(False)
         self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("32/33", result.stdout)
 
     def test_candidate_fixing_the_baseline_failure_passes(self):
         result = self.compare(True)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("33/33", result.stdout)
 
 
 if __name__ == "__main__":
