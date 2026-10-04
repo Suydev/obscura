@@ -89,6 +89,7 @@ pub struct JsNetworkEvent {
     pub intercepted: bool,
     pub url: String,
     pub method: String,
+    pub resource_type: String,
     pub status: u16,
     pub response_headers: HashMap<String, String>,
     pub body_size: usize,
@@ -818,6 +819,12 @@ pub type SharedState = Rc<RefCell<ObscuraState>>;
 #[derive(Default)]
 pub struct RealmStates {
     entries: Vec<(v8::Global<v8::Context>, u32, SharedState)>,
+    frame_timers: HashMap<u32, FrameTimers>,
+}
+
+struct FrameTimers {
+    owner: Option<(std::rc::Weak<RefCell<ObscuraState>>, NodeId, u64)>,
+    cancel: Rc<CancelHandle>,
 }
 
 impl RealmStates {
@@ -831,7 +838,10 @@ impl RealmStates {
     }
 
     pub(crate) fn forget_frame(&mut self, frame_id: u32) {
+        self.cancel_frame_timers(frame_id);
         self.entries.retain(|(_, id, _)| *id != frame_id);
+        self.frame_timers.remove(&frame_id);
+        self.cancel_inactive_frame_timers();
     }
     pub fn register(
         &mut self,
@@ -839,11 +849,97 @@ impl RealmStates {
         frame_id: u32,
         state: SharedState,
     ) {
+        self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
+            owner: None, cancel: CancelHandle::new_rc(),
+        });
         self.entries.push((context, frame_id, state));
     }
 
     pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
-        self.entries.retain(|(known, _, _)| known != context);
+        if let Some(id) = self.entries.iter().find(|(known, _, _)| known == context)
+            .map(|(_, id, _)| *id)
+        {
+            self.forget_frame(id);
+        }
+    }
+
+    fn own_frame(&mut self, frame_id: u32, parent: &SharedState, node: NodeId) {
+        let generation = parent.borrow().document_generation;
+        self.frame_timers.entry(frame_id).or_insert_with(|| FrameTimers {
+            owner: None, cancel: CancelHandle::new_rc(),
+        }).owner = Some((Rc::downgrade(parent), node, generation));
+    }
+
+    fn frame_timers_active(&self, mut frame_id: u32) -> Option<bool> {
+        // A child document is active only while all of its owners are active.
+        // Keep the walk bounded even if an invalid frame-parent chain arrives.
+        for _ in 0..=self.frame_timers.len() {
+            let Some(timers) = self.frame_timers.get(&frame_id) else { return Some(false) };
+            if timers.cancel.is_canceled() { return Some(false); }
+            let Some((parent, node, generation)) = &timers.owner else { return Some(true) };
+            let Some(parent) = parent.upgrade() else { return Some(false) };
+            // Host teardown may already hold the owner. Contention does not
+            // establish that a sibling document is dead, so defer that check.
+            let parent = parent.try_borrow().ok()?;
+            if parent.document_generation != *generation
+                || !parent.dom.as_ref().is_some_and(|dom| dom.is_connected(*node))
+            {
+                return Some(false);
+            }
+            frame_id = parent.frame_id;
+            if frame_id == 0 { return Some(true); }
+        }
+        Some(false)
+    }
+
+    pub(crate) fn cancel_inactive_frame_timers(&self) {
+        for (id, timers) in &self.frame_timers {
+            if self.frame_timers_active(*id) == Some(false) { timers.cancel.cancel(); }
+        }
+    }
+
+    fn cancel_frame_timers(&self, frame_id: u32) {
+        if let Some(timers) = self.frame_timers.get(&frame_id) { timers.cancel.cancel(); }
+        self.cancel_inactive_frame_timers();
+    }
+
+    fn frames_removed_by(&self, shared: &SharedState, cmd: &str, arg1: &str, arg2: &str)
+        -> Vec<(u32, u32)>
+    {
+        if self.frame_timers.is_empty() { return Vec::new(); }
+        let (root, inclusive) = match cmd {
+            "append_child" => (arg2, true),
+            "insert_before" | "remove_child" => (arg1, true),
+            "set_inner_html" | "set_inner_html_context" | "set_fragment_html_executable"
+                | "set_text_content" => (arg1, false),
+            _ => return Vec::new(),
+        };
+        let Ok(root) = root.parse::<u32>() else { return Vec::new() };
+        let root = NodeId::new(root);
+        let state = shared.borrow();
+        let Some(dom) = &state.dom else { return Vec::new() };
+        let mut removed = Vec::new();
+        // ponytail: scan the bounded live-frame registry only on structural
+        // mutations; index owners by document if frame-heavy profiling warrants it.
+        for (id, timers) in &self.frame_timers {
+            let Some((parent, node, generation)) = &timers.owner else { continue };
+            if parent.as_ptr() != Rc::as_ptr(shared) || *generation != state.document_generation
+                || timers.cancel.is_canceled() || !dom.is_connected(*node)
+            {
+                continue;
+            }
+            let mut current = Some(*node);
+            for _ in 0..=dom.len() {
+                let Some(current_node) = current else { break };
+                if current_node == root && (inclusive || current_node != *node) {
+                    removed.push((*id, node.index() as u32));
+                    break;
+                }
+                current = dom.with_node(current_node, |node| node.parent).flatten()
+                    .or_else(|| dom.shadow_root_info(current_node).map(|root| root.host));
+            }
+        }
+        removed
     }
 
     pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
@@ -1699,7 +1795,25 @@ fn op_dom(
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        op_dom_inner(shared, cmd, arg1, arg2)
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>();
+        if cmd == "retire_frame" {
+            if let Ok(id) = arg1.parse::<u32>() { registry.borrow().cancel_frame_timers(id); }
+            return "true".into();
+        }
+        let removed = registry.borrow().frames_removed_by(&shared, &cmd, &arg1, &arg2);
+        let result = op_dom_inner(shared, cmd, arg1, arg2);
+        if result == "true" && !removed.is_empty() {
+            let registry = registry.borrow();
+            for (id, _) in &removed {
+                if let Some(timers) = registry.frame_timers.get(id) { timers.cancel.cancel(); }
+            }
+            registry.cancel_inactive_frame_timers();
+            // The bootstrap unwraps this private mutation result before any
+            // DOM caller sees it, and resets only the retired iframe identities.
+            serde_json::json!({"__obscuraFrameRetirements":removed,"result":result}).to_string()
+        } else {
+            result
+        }
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
@@ -1959,6 +2073,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             "null".to_string()
         }
         "document_node_id" => dom.document().index().to_string(),
+        "document_compat_mode" => if dom.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script
             // changes through title.textContent must be reflected by
@@ -2471,26 +2586,36 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.write() feeds the document's input stream, so the calls
         // share one parser and one tokenizer state. Returns the nodes that
         // became complete with this call, for the caller to run scripts among.
-        // Returns [[parent, node], …], parents before children. A `parent` of 0 means the node
+        // Returns [[parent, node, before], …], parents before children. A `parent` of -1 means the node
         // belongs at the insertion point, which the caller knows. Nothing is inserted here:
         // that must go through Node.appendChild on the JS side, because that call also reports
         // the mutation, registers window named access, and loads a written stylesheet.
-        "document_write" => {
+        "document_write" | "document_write_close" => {
             let mut slot = gs.write_stream.borrow_mut();
-            let stream = slot.get_or_insert_with(DocumentWriteStream::new);
-            let placements = stream.write(&arg2, dom);
+            let placements = if cmd == "document_write_close" {
+                let Some(mut stream) = slot.take() else { return "[]".into(); };
+                let placements = stream.close(dom);
+                // EOF in a script's text insertion mode marks it already started.
+                // Newly released scripts have no closing tag and must not execute.
+                gs.already_started_scripts.borrow_mut().extend(placements.iter()
+                    .filter(|p| node_is_script(dom, p.node)).map(|p| p.node));
+                placements
+            } else {
+                slot.get_or_insert_with(|| DocumentWriteStream::new(false)).write(&arg2, dom)
+            };
             if placements
                 .iter()
                 .any(|placement| node_is_script(dom, placement.node))
             {
                 gs.document_write_inserted_script.set(true);
             }
-            let pairs: Vec<[i32; 2]> = placements
+            let pairs: Vec<[i32; 3]> = placements
                 .iter()
                 .map(|placement| {
                     [
-                        placement.parent.map_or(0, |id| id.index() as i32),
+                        placement.parent.map_or(-1, |id| id.index() as i32),
                         placement.node.index() as i32,
+                        placement.before.map_or(-1, |id| id.index() as i32),
                     ]
                 })
                 .collect();
@@ -2498,7 +2623,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         // document.open() discards what the input stream holds and starts over.
         "document_write_reset" => {
-            *gs.write_stream.borrow_mut() = None;
+            dom.set_quirks(false);
+            *gs.write_stream.borrow_mut() = Some(DocumentWriteStream::new(true));
             gs.document_write_inserted_script.set(false);
             "true".into()
         }
@@ -3307,8 +3433,17 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
-    internal_load: bool,
+    #[string] destination: String,
 ) -> Result<String, deno_error::JsErrorBox> {
+    let (resource_type, resource_type_name) = match destination.as_str() {
+        "Script" => (ResourceType::Script, "Script"),
+        "Stylesheet" => (ResourceType::Stylesheet, "Stylesheet"),
+        "Document" => (ResourceType::Document, "Document"),
+        "XHR" => (ResourceType::Xhr, "XHR"),
+        _ => (ResourceType::Fetch, "Fetch"),
+    };
+    let internal_load = matches!(resource_type,
+        ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document);
     let body = body.to_vec();
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
@@ -3418,7 +3553,7 @@ async fn op_fetch_url(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
-            resource_type: "Fetch".to_string(),
+            resource_type: resource_type_name.to_string(),
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -3437,6 +3572,7 @@ async fn op_fetch_url(
                     record_js_network_completion(&state, JsNetworkEvent {
                         request_id: request_id.clone(), intercepted: true,
                         url: url.clone(), method: method.clone(), status,
+                        resource_type: resource_type_name.to_string(),
                         response_headers: h.clone(), body_size,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default().as_secs_f64(),
@@ -3558,7 +3694,7 @@ async fn op_fetch_url(
                     url: parsed,
                     method: method.clone(),
                     headers: custom_headers.clone(),
-                    resource_type: ResourceType::Fetch,
+                    resource_type,
                 };
                 cbs.fire_request(&info).await;
             }
@@ -3675,6 +3811,10 @@ async fn op_fetch_url(
                 callbacks.clone(),
                 allow_private_network,
                 internal_load,
+                resource_type,
+                resource_type_name,
+                request_id,
+                was_intercepted,
             )
             .await;
         }
@@ -3939,7 +4079,7 @@ async fn op_fetch_url(
                 );
                 let info = RequestInfo {
                     url: resp.url.clone(), method: current_method.as_str().to_string(),
-                    headers: resp_headers.clone(), resource_type: ResourceType::Fetch,
+                    headers: resp_headers.clone(), resource_type,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
@@ -3948,6 +4088,7 @@ async fn op_fetch_url(
             record_js_network_completion(&state, JsNetworkEvent {
                 request_id, intercepted: was_intercepted,
                 url: current_url, method: current_method.as_str().to_string(), status,
+                resource_type: resource_type_name.to_string(),
                 response_headers: resp_headers, body_size: resp_bytes.len(),
                 timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default().as_secs_f64(),
@@ -3982,8 +4123,7 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar. Request identity and destination survive transport selection.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
     state: Rc<RefCell<OpState>>,
@@ -3999,6 +4139,10 @@ async fn stealth_fetch_all(
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
     internal_load: bool,
+    resource_type: ResourceType,
+    resource_type_name: &'static str,
+    request_id: String,
+    was_intercepted: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -4168,11 +4312,13 @@ async fn stealth_fetch_all(
 
     let metadata = serde_json::json!({
         "status": if opaque { 0 } else { status },
+        "requestId": request_id,
         "url": current_url,
         "redirected": redirects_followed > 0,
         "opaque": opaque,
         "headers": script_headers,
     });
+    let body_state = Rc::downgrade(&state);
     let body = Box::pin(async move {
         let _page_in_flight = page_in_flight;
         let resp_bytes = response.body.await
@@ -4184,11 +4330,21 @@ async fn stealth_fetch_all(
                     resp_bytes.clone(), redirected_from,
                 );
                 let info = RequestInfo {
-                    url: resp.url.clone(), method: current_method,
-                    headers: resp_headers, resource_type: ResourceType::Fetch,
+                    url: resp.url.clone(), method: current_method.clone(),
+                    headers: resp_headers.clone(), resource_type,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
+        }
+        if let Some(state) = body_state.upgrade() {
+            record_js_network_completion(&state, JsNetworkEvent {
+                request_id, intercepted: was_intercepted,
+                url: current_url, method: current_method, status,
+                resource_type: resource_type_name.to_string(),
+                response_headers: resp_headers, body_size: resp_bytes.len(),
+                timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs_f64(),
+            }, &String::from_utf8_lossy(&resp_bytes), false);
         }
         Ok(resp_bytes)
     });
@@ -5524,8 +5680,18 @@ fn op_post_frame_message(
 /// instead, and V8 reports the frame as the microtask context, so the ops a
 /// timer callback makes still find the frame's own document.
 #[op2]
-async fn op_sleep(#[number] millis: u64) {
-    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+async fn op_sleep(state: Rc<RefCell<OpState>>, #[number] millis: u64, frame_id: Option<u32>) -> bool {
+    let sleep = tokio::time::sleep(std::time::Duration::from_millis(millis));
+    let frame_id = frame_id.unwrap_or(0);
+    if frame_id == 0 { sleep.await; return true; }
+    let cancel = {
+        let state = state.borrow();
+        let registry = state.borrow::<Rc<RefCell<RealmStates>>>().borrow();
+        registry.cancel_inactive_frame_timers();
+        registry.frame_timers.get(&frame_id).map(|timers| timers.cancel.clone())
+    };
+    let Some(cancel) = cancel else { return false };
+    sleep.or_cancel(cancel).await.is_ok()
 }
 
 const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
@@ -5542,11 +5708,13 @@ fn op_frame_document_ready(
     #[string] html: &str,
     #[number] viewport_width: u64,
     #[number] viewport_height: u64,
+    owner_node: u32,
 ) -> u32 {
     // Whoever called this is the new frame's parent, which is how a frame
     // nested two deep gets `parent` pointing at the frame above it rather than
     // at the page.
-    let parent_frame_id = realm_state(scope, state).borrow().frame_id;
+    let parent = realm_state(scope, state);
+    let parent_frame_id = parent.borrow().frame_id;
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     let bytes = url.len().saturating_add(html.len());
@@ -5574,6 +5742,9 @@ fn op_frame_document_ready(
         viewport_height,
         parent_frame_id,
     });
+    drop(gs);
+    state.borrow::<Rc<RefCell<RealmStates>>>().borrow_mut()
+        .own_frame(frame_id, &parent, NodeId::new(owner_node));
     frame_id
 }
 
@@ -5630,6 +5801,7 @@ fn op_initial_frame(
     state: &OpState,
     parent_frame_id: u32,
     initialize: v8::Local<v8::Function>,
+    owner_node: u32,
 ) -> u32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let registry = state.borrow::<Rc<RefCell<RealmStates>>>().clone();
@@ -5663,7 +5835,7 @@ fn op_initial_frame(
         {
             let parent = parent_state.borrow();
             child.dom = Some(obscura_dom::parse_html(
-                "<!DOCTYPE html><html><head></head><body></body></html>"));
+                "<html><head></head><body></body></html>"));
             child.frame_id = frame_id;
             child.about_base_url = document_base_url(&parent);
             child.inherited_origin = Some(parent.inherited_origin.clone().unwrap_or_else(|| {
@@ -5674,6 +5846,7 @@ fn op_initial_frame(
         }
         let handle = v8::Global::new(scope, context);
         registry.borrow_mut().register(handle.clone(), frame_id, Rc::new(RefCell::new(child)));
+        registry.borrow_mut().own_frame(frame_id, &parent_state, NodeId::new(owner_node));
         let window = context.global(scope);
         let id = v8::Integer::new_from_unsigned(scope, frame_id);
         let receiver = v8::undefined(scope);
@@ -5787,7 +5960,9 @@ fn posted_task_owner(state: &OpState, frame_id: u32) -> Option<SharedState> {
         return Some(state.borrow::<SharedState>().clone());
     }
     let registry = state.try_borrow::<Rc<RefCell<RealmStates>>>()?.clone();
-    let owner = registry.try_borrow().ok()?.by_frame_id(frame_id);
+    let registry = registry.try_borrow().ok()?;
+    if registry.frame_timers_active(frame_id) != Some(true) { return None; }
+    let owner = registry.by_frame_id(frame_id);
     owner
 }
 
@@ -6633,6 +6808,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_layout_geometry());
         ops.push(op_layout_box_metrics());
         ops.push(op_layout_hit_test());
+        ops.push(op_layout_caret());
+        ops.push(op_layout_caret_rect());
         ops.push(op_resize_observer_measurements());
         ops.push(op_intersection_observer_measurements());
         ops.push(op_computed_style());
@@ -6971,7 +7148,7 @@ fn ensure_prepared_render_with_base_url(
                         animation_sample,
                         &mut state.animation_timeline,
                     )?,
-                    obscura_render::CssMediaType::Print => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
+                    _ => obscura_render::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_for_media_with_animation_state(
                         dom,
                         viewport,
                         base_url.as_deref(),
@@ -7689,6 +7866,40 @@ fn op_layout_hit_test(state: &OpState, x: f64, y: f64, frame_id: u32) -> i32 {
     prepared
         .hit_test(dom, scroll, x as f32, y as f32)
         .map_or(-1, |id| id.index() as i32)
+}
+
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_caret(state: &OpState, x: f64, y: f64, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        ensure_resolved_scroll_for_geometry(&mut gs)?;
+        let (_, scroll) = gs.resolved_scroll.as_ref()?;
+        let prepared = gs.prepared_render.as_ref()?;
+        let dom = gs.dom.as_ref()?;
+        let (node, offset) = prepared.caret_from_point(dom, scroll, x as f32, y as f32)?;
+        Some(serde_json::json!([node.raw(), offset]).to_string())
+    })).ok().flatten().unwrap_or_default()
+}
+
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_layout_caret_rect(state: &OpState, #[string] nid: String, offset: u32, frame_id: u32) -> String {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let node = NodeId::new(nid.parse().ok()?);
+        let shared = frame_state(state, frame_id);
+        let mut gs = shared.borrow_mut();
+        sample_live_document_animations(&mut gs);
+        ensure_resolved_scroll_for_geometry(&mut gs)?;
+        let (_, scroll) = gs.resolved_scroll.as_ref()?;
+        let rect = gs.prepared_render.as_ref()?.caret_rect(gs.dom.as_ref()?, scroll, node, offset as usize)?;
+        Some(serde_json::json!({"x": rect.x, "y": rect.y,
+            "width": rect.width, "height": rect.height}).to_string())
+    })).ok().flatten().unwrap_or_default()
 }
 
 /// Measure every target in one ResizeObserver rendering opportunity.

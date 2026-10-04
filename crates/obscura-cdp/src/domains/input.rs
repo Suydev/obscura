@@ -21,13 +21,20 @@ fn js_str(s: &str) -> String {
 // they left out: a newline inside a single-quoted literal is a syntax error,
 // so the whole snippet was dropped and nothing was inserted. obscura-mcp
 // already builds its typing snippet this way.
-fn insert_text_js(text: &str) -> String {
+fn insert_text_js(text: &str, ime_commit: bool) -> String {
     let literal = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            if (globalThis.__obscura_isDisabled(t)) return;\
+            if (!{ime_commit} && t.hasAttribute('readonly')) return;\
             var ins = {text};\
+            var commitStart = {ime_commit} ? t.selectionStart : null;\
+            if ({ime_commit} && commitStart == null) commitStart = (t.value || '').length;\
+            var before = globalThis.__obscura_markTrusted(new InputEvent('beforeinput', {{bubbles:true,composed:true,cancelable:true,data:ins,inputType:'insertText'}}));\
+            if (!t.dispatchEvent(before)) return;\
+            if (t.hasAttribute('readonly') || globalThis.__obscura_isDisabled(t)) return;\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
             if (s == null) {{\
@@ -37,10 +44,10 @@ fn insert_text_js(text: &str) -> String {
                 e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
                 var lo = Math.min(s, e), hi = Math.max(s, e);\
                 globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
-                var caret = lo + ins.length;\
+                var caret = Math.max(0, Math.min((commitStart == null ? lo : commitStart) + ins.length, t.value.length));\
                 t.setSelectionRange(caret, caret);\
             }}\
-            t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+            t.dispatchEvent(globalThis.__obscura_markTrusted(new InputEvent('input', {{bubbles:true,composed:true,data:ins,inputType:'insertText'}})));\
         }})()",
         text = literal,
     )
@@ -397,7 +404,9 @@ pub async fn handle(
         "insertText" => {
             let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(page) = ctx.get_session_page_mut(session_id) {
-                page.evaluate(&insert_text_js(text));
+                // IME commits snapshot the final caret before beforeinput.
+                // Keyboard insertion instead follows the handler's selection.
+                page.evaluate(&insert_text_js(text, true));
             }
             Ok(json!({}))
         }
@@ -433,7 +442,7 @@ pub async fn handle(
                         page.evaluate(&js);
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
-                            page.evaluate(&insert_text_js(text));
+                            page.evaluate(&insert_text_js(text, false));
                         }
 
                         if key == "Enter" {
@@ -486,7 +495,7 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
-                            page.evaluate(&insert_text_js(text));
+                            page.evaluate(&insert_text_js(text, false));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }

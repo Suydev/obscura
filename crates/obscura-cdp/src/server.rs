@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::SocketAddr;
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -676,11 +677,11 @@ fn publish_ready_file(path: &Path, address: SocketAddr) -> anyhow::Result<()> {
         uuid::Uuid::new_v4()
     ));
     let result = (|| -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&temporary)?;
         file.write_all(&record)?;
         file.sync_all()?;
         std::fs::rename(&temporary, path)
@@ -1420,12 +1421,16 @@ fn emit_intercepted_request(
             let (session_id, _) = ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)?;
             Some((page.frame_id.as_str(), Some(session_id.clone())))
         });
-    emit_routed_intercepted_request(intercepted, route, reply_tx, intercepted_paused);
+    let observers = route.as_ref().map_or_else(Vec::new, |(_, session_id)| {
+        crate::domains::page::network_observer_sessions(ctx, &intercepted.page_id, session_id)
+    });
+    emit_routed_intercepted_request(intercepted, route, &observers, reply_tx, intercepted_paused);
 }
 
 fn emit_routed_intercepted_request(
     intercepted: obscura_js::ops::InterceptedRequest,
     route: Option<(&str, Option<String>)>,
+    observers: &[String],
     reply_tx: &mpsc::UnboundedSender<String>,
     intercepted_paused: &mut HashMap<String, tokio::sync::oneshot::Sender<obscura_js::ops::InterceptResolution>>,
 ) {
@@ -1467,6 +1472,11 @@ fn emit_routed_intercepted_request(
         "sessionId": session_id,
     });
     let _ = reply_tx.send(request_will_be_sent.to_string());
+    for observer in observers {
+        let mut event = request_will_be_sent.clone();
+        event["sessionId"] = json!(observer);
+        let _ = reply_tx.send(event.to_string());
+    }
 
     let request_paused = json!({
         "method": "Fetch.requestPaused",
@@ -2022,9 +2032,17 @@ async fn process_awaited_with_interception(
 ) {
     // The evaluation owns ctx (and V8) until it completes. Snapshot only routing
     // metadata so request replies can unblock it without entering another isolate.
+    let requesting_session = serde_json::from_str::<CdpRequest>(text).ok()
+        .and_then(|request| request.session_id);
     let routes: HashMap<_, _> = ctx.pages.iter().filter_map(|page| {
-        let (session_id, _) = ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)?;
-        Some((page.id.clone(), (page.frame_id.clone(), session_id.clone())))
+        let session_id = requesting_session.as_ref()
+            .filter(|session| ctx.sessions.get(*session) == Some(&page.id))
+            .or_else(|| ctx.sessions.iter().find(|(_, page_id)| **page_id == page.id)
+                .map(|(session, _)| session))?;
+        let observers = crate::domains::page::network_observer_sessions(
+            ctx, &page.id, &Some(session_id.clone()),
+        );
+        Some((page.id.clone(), (page.frame_id.clone(), session_id.clone(), observers)))
     }).collect();
     let command = process_cdp_message(text, ctx, reply_tx);
     tokio::pin!(command);
@@ -2037,9 +2055,11 @@ async fn process_awaited_with_interception(
                     None => std::future::pending().await,
                 }
             } => {
-                let route = routes.get(&intercepted.page_id)
-                    .map(|(frame_id, session_id)| (frame_id.as_str(), Some(session_id.clone())));
-                emit_routed_intercepted_request(intercepted, route, reply_tx, intercepted_paused);
+                let (route, observers) = routes.get(&intercepted.page_id)
+                    .map(|(frame_id, session_id, observers)| (
+                        Some((frame_id.as_str(), Some(session_id.clone()))), observers.as_slice(),
+                    )).unwrap_or((None, &[]));
+                emit_routed_intercepted_request(intercepted, route, observers, reply_tx, intercepted_paused);
             }
             Some(message) = rx.recv() => {
                 if let ServerMessage::Cdp(msg) = &message {
@@ -2257,6 +2277,36 @@ mod tests {
     use obscura_net::{CookieInfo, CookieJar};
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn intercepted_request_is_observable_without_sharing_fetch_control() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page = ctx.create_page();
+        let other = ctx.create_page();
+        ctx.sessions.insert("driver".into(), page.clone());
+        ctx.sessions.insert("observer".into(), page.clone());
+        ctx.sessions.insert("unrelated".into(), other);
+        let (resolver, _resolution) = tokio::sync::oneshot::channel();
+        let intercepted = obscura_js::ops::InterceptedRequest {
+            request_id: "fetch-1".into(), page_id: page.clone(), url: "https://example.test/data".into(),
+            method: "GET".into(), headers: Default::default(), resource_type: "Fetch".into(), resolver,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut paused = HashMap::new();
+        super::emit_intercepted_request(intercepted, &ctx, Some((&page, "frame-1", Some("driver".into()))), &tx, &mut paused);
+        let driver: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let observer: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        let pause: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(driver["method"], "Network.requestWillBeSent");
+        assert_eq!(observer["method"], driver["method"]);
+        assert_eq!(observer["params"], driver["params"]);
+        assert_eq!(observer["sessionId"], "observer");
+        assert_eq!(pause["method"], "Fetch.requestPaused");
+        assert_eq!(pause["sessionId"], "driver");
+        assert_eq!(paused.len(), 1);
+        assert!(paused.contains_key("fetch-1"));
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn lifecycle_subscription_commands_reach_the_stateful_dispatcher() {
@@ -3019,6 +3069,13 @@ mod tests {
                 let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
                 if value["id"] == 2 { break; }
             }
+            let target_id = session.strip_suffix("-session").unwrap();
+            send(json!({"id": 50, "method": "Target.attachToTarget",
+                "params": {"targetId": target_id, "flatten": true}}));
+            let observer = loop {
+                let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                if value["id"] == 50 { break value["result"]["sessionId"].as_str().unwrap().to_string(); }
+            };
             let body = "let result=''; for(let i=0;i<2;i++) result+=await (await fetch('http://127.0.0.1:9/'+i)).text(); return result";
             for (id, method, params) in [
                 (3, "Runtime.evaluate", json!({"expression": format!("(async()=>{{{body}}})()"), "awaitPromise": true, "returnByValue": true})),
@@ -3031,9 +3088,18 @@ mod tests {
                 let mut completed = false;
                 let mut finished = 0;
                 let mut deferred_completed = false;
+                let mut driver_requests = Vec::new();
+                let mut observer_requests = Vec::new();
                 tokio::time::timeout(Duration::from_secs(3), async {
                     loop {
                         let value: Value = serde_json::from_str(&reply_rx.recv().await.unwrap()).unwrap();
+                        if value["method"] == "Network.requestWillBeSent" {
+                            if value["sessionId"] == session {
+                                driver_requests.push(value["params"].clone());
+                            } else if value["sessionId"] == observer {
+                                observer_requests.push(value["params"].clone());
+                            }
+                        }
                         if value["method"] == "Fetch.requestPaused" {
                             assert_eq!(value["sessionId"], session);
                             pauses += 1;
@@ -3046,15 +3112,17 @@ mod tests {
                             assert_eq!(pauses, 2);
                             completed = true;
                         }
-                        if value["method"] == "Network.loadingFinished" { finished += 1; }
+                        if value["method"] == "Network.loadingFinished" && value["sessionId"] == session { finished += 1; }
                         if value["id"] == 10 + id {
                             assert!(completed, "unrelated V8 work must stay deferred");
                             assert_eq!(value["result"]["result"]["value"].as_f64(), Some(42.0));
                             deferred_completed = true;
                         }
-                        if completed && deferred_completed && finished == 2 { break; }
+                        if completed && deferred_completed && finished == 2 && observer_requests.len() == 2 { break; }
                     }
                 }).await.expect("awaited evaluation must service route replies");
+                assert_eq!(driver_requests.len(), 2);
+                assert_eq!(observer_requests, driver_requests);
             }
             drop(server_tx);
             tokio::time::timeout(Duration::from_secs(2), processor).await.unwrap().unwrap();

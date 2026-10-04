@@ -108,3 +108,78 @@ async fn typing_continues_after_the_inserted_newline() {
     assert_eq!(result["start"], 3);
     assert_eq!(result["end"], 3);
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn text_insertion_dispatches_cancelable_beforeinput_and_trusted_input_events() {
+    let mut ctx = setup().await;
+    for tag in ["input", "textarea"] {
+        for (method, params) in [
+            ("Input.insertText", json!({"text": "Z"})),
+            ("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "Z", "text": "Z"})),
+            ("Input.dispatchKeyEvent", json!({"type": "char", "text": "Z"})),
+        ] {
+            evaluate(&mut ctx, &format!(r#"(function() {{
+                document.body.innerHTML = '<{tag} id="field"></{tag}>';
+                var field = document.getElementById('field');
+                field.value = 'abCD'; field.focus(); field.setSelectionRange(1, 3);
+                globalThis.editEvents = [];
+                for (var type of ['beforeinput', 'input']) field.addEventListener(type, function(e) {{
+                    editEvents.push([e.type, e instanceof InputEvent, e.data, e.inputType,
+                        e.isTrusted, e.bubbles, e.composed, e.cancelable, field.value]);
+                }});
+            }})()"#)).await;
+            cdp(&mut ctx, method, params).await;
+            assert_eq!(evaluate(&mut ctx, "document.getElementById('field').value").await, "aZD");
+            assert_eq!(evaluate(&mut ctx, "editEvents").await, json!([
+                ["beforeinput", true, "Z", "insertText", true, true, true, true, "abCD"],
+                ["input", true, "Z", "insertText", true, true, true, false, "aZD"]
+            ]), "{tag}: {method}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn canceled_or_readonly_text_insertion_preserves_value_and_selection() {
+    let mut ctx = setup().await;
+    for tag in ["input", "textarea"] {
+        for guard in [
+            "field.addEventListener('beforeinput', function(e) { e.preventDefault(); });",
+            "field.readOnly = true;",
+            "field.setAttribute('readonly', '');",
+        ] {
+            evaluate(&mut ctx, &format!(r#"(function() {{
+                document.body.innerHTML = '<{tag} id="field"></{tag}>';
+                var field = document.getElementById('field');
+                field.value = 'abCD'; field.focus(); field.setSelectionRange(1, 3);
+                globalThis.editEvents = [];
+                for (var type of ['beforeinput', 'input']) field.addEventListener(type, function(e) {{
+                    editEvents.push(e.type);
+                }});
+                {guard}
+            }})()"#)).await;
+            cdp(&mut ctx, "Input.insertText", json!({"text": "Z"})).await;
+            assert_eq!(evaluate(&mut ctx, "(function() { var field = document.getElementById('field'); return [field.value, field.selectionStart, field.selectionEnd, editEvents]; })()").await,
+                json!(["abCD", 1, 3, ["beforeinput"]]), "{tag}: {guard}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn text_insertion_reads_value_and_selection_after_beforeinput_handlers() {
+    let mut ctx = setup().await;
+    evaluate(&mut ctx, r#"field.addEventListener('beforeinput', function() {
+            field.value = 'xy'; field.setSelectionRange(0, 1);
+        });"#).await;
+    for (method, params, caret) in [
+        ("Input.insertText", json!({"text": "Z"}), 2),
+        ("Input.dispatchKeyEvent", json!({"type": "keyDown", "key": "Z", "text": "Z"}), 1),
+        ("Input.dispatchKeyEvent", json!({"type": "char", "text": "Z"}), 1),
+    ] {
+        evaluate(&mut ctx, "field.value = 'abCD'; field.setSelectionRange(1, 3);").await;
+        cdp(&mut ctx, method, params).await;
+        let result = state(&mut ctx).await;
+        assert_eq!(result["value"], "Zy");
+        assert_eq!(result["start"], caret, "{method}");
+        assert_eq!(result["end"], caret, "{method}");
+    }
+}

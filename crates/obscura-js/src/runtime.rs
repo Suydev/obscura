@@ -1229,6 +1229,8 @@ impl ObscuraJsRuntime {
             gs.scroll_generation = 0;
             gs.resolved_scroll = None;
         }
+        drop(gs);
+        self.realm_states().borrow().cancel_inactive_frame_timers();
     }
 
     pub fn set_url(&self, url: &str) {
@@ -1444,6 +1446,7 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_viewport_w={width};\
                  globalThis.__obscura_viewport_h={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                 globalThis.__obscura_recompute_media_queries();\
                  if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
@@ -1456,6 +1459,19 @@ impl ObscuraJsRuntime {
                  }}",
             ),
         );
+    }
+
+    /// Keep JavaScript media queries and CSS selection on the same preference.
+    pub fn set_reduced_motion(&mut self, reduce: bool) {
+        #[cfg(feature = "render")]
+        {
+            let media = self.state.borrow().render_media.with_reduced_motion(reduce);
+            self.set_render_media(media);
+        }
+        let _ = self.execute_runtime_script("<reduced-motion>", format!(
+            "globalThis.__obscura_reduced_motion={reduce};\
+             globalThis.__obscura_recompute_media_queries();"
+        ));
     }
 
     /// Override the physical screen metrics exposed to page JavaScript.
@@ -1524,6 +1540,11 @@ impl ObscuraJsRuntime {
     /// Select the CSS media type for the next synchronous render flush.
     /// Changing media invalidates geometry and the compiled stylesheet key but
     /// leaves the live DOM, scroll offsets, and resource bytes untouched.
+    #[cfg(feature = "render")]
+    pub fn prefers_reduced_motion(&self) -> bool {
+        self.state.borrow().render_media.reduced_motion()
+    }
+
     #[cfg(feature = "render")]
     pub fn set_render_media(
         &self,
@@ -4981,6 +5002,24 @@ mod tests {
     }
 
     #[test]
+    fn initial_blank_iframe_has_no_doctype_and_starts_in_quirks_mode() {
+        let mut rt = setup_runtime("<!doctype html><body></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentWindow;
+            const initial = JSON.parse(child.eval(`JSON.stringify([
+                document.compatMode, document.doctype,
+                Array.from(document.childNodes, node => node.nodeType),
+                document.documentElement.nodeName, document.head.nodeName, document.body.nodeName
+            ])`));
+            return [initial, document.compatMode];
+        })()"#).unwrap(), serde_json::json!([
+            ["BackCompat", null, [1], "HTML", "HEAD", "BODY"], "CSS1Compat"
+        ]));
+    }
+
+    #[test]
     fn initial_blank_iframe_eval_uses_the_child_realm() {
         let mut rt = setup_runtime("<html><body></body></html>");
         assert_eq!(
@@ -5068,6 +5107,89 @@ mod tests {
         })()"#).unwrap(), serde_json::json!([
             [[100, 20, 28]], [28], [100, 20, 100, 20], true, 45
         ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_use_shaped_text_and_utf16_offsets() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}span{display:inline-block}</style><span id='text'>A😀BC</span>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            if (typeof document.caretRangeFromPoint !== 'function' ||
+                typeof document.caretPositionFromPoint !== 'function') return 'missing caret API';
+            const element = document.getElementById('text'), text = element.firstChild;
+            const r = element.getBoundingClientRect();
+            const results = [];
+            for (const name of ['caretRangeFromPoint', 'caretPositionFromPoint']) {
+                for (const x of [r.left + .1, r.right - .1]) {
+                    const c = document[name](x, r.top + 12);
+                    results.push([(c.startContainer || c.offsetNode) === text,
+                        c.startOffset ?? c.offset]);
+                }
+                results.push(document[name](-1, 12) === null);
+            }
+            return results;
+        })()"#).unwrap(), serde_json::json!([
+            [true, 0], [true, 5], true, [true, 0], [true, 5], true
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_find_flattened_mixed_content_runs() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}</style><div>AAAA<div style='height:30px'></div><span id='text'>ABCD</span></div>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const text = document.getElementById('text').firstChild;
+            const caret = document.caretPositionFromPoint(1, 66);
+            return [caret.offsetNode === text, caret.offset];
+        })()"#).unwrap(), serde_json::json!([true, 0]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_legacy_ranges_exclude_widget_internal_text() {
+        let mut rt = setup_runtime("<style>body{margin:0}input,textarea{display:block;border:0;padding:0;font:20px/24px monospace;width:200px;height:24px}</style><div></div><input id='input'><textarea id='textarea'>ABCD</textarea>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const result = [];
+            for (const id of ['input', 'textarea']) {
+                const widget = document.getElementById(id);
+                widget.value = 'A😀BC';
+                const rect = widget.getBoundingClientRect();
+                for (const x of [rect.left + .1, rect.right - .1]) {
+                    const range = document.caretRangeFromPoint(x, rect.top + 12);
+                    result.push([range.startContainer === document.body,
+                        range.startOffset, range.collapsed]);
+                }
+            }
+            return result;
+        })()"#).unwrap(), serde_json::json!([
+            [true, 1, true], [true, 1, true], [true, 2, true], [true, 2, true]
+        ]));
+    }
+
+    #[cfg(feature = "render")]
+    #[test]
+    fn document_carets_keep_receiver_realm_and_current_geometry() {
+        let mut rt = setup_runtime("<style>body{margin:0;font:20px/24px monospace}#parent{display:inline-block}</style><span id='parent'>ABCD</span>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            if (typeof document.caretPositionFromPoint !== 'function') return 'missing caret API';
+            const iframe = document.createElement('iframe'); iframe.style.display = 'block'; document.body.appendChild(iframe);
+            const d = iframe.contentDocument;
+            d.body.innerHTML = '<style>body{margin:0;font:20px/24px monospace}#child{display:inline-block}</style><span id="child">WXYZ</span>';
+            const child = d.getElementById('child'), parent = document.getElementById('parent');
+            const foreign = iframe.contentWindow.Document.prototype;
+            const borrowed = Document.prototype.caretPositionFromPoint.call(d, .1, 12);
+            const reverse = foreign.caretPositionFromPoint.call(document, .1, 12);
+            const position = document.caretPositionFromPoint(.1, 12);
+            const before = position.getClientRect();
+            parent.style.transform = 'translate(40px,50px)';
+            const after = position.getClientRect();
+            let invalid = false;
+            try { document.caretPositionFromPoint(Infinity, 0); } catch (e) { invalid = e instanceof TypeError; }
+            return [borrowed.offsetNode === child.firstChild, reverse.offsetNode === parent.firstChild,
+                position.offset === 0, before.width === 0 && before.height > 0,
+                Math.abs(after.x - before.x - 40) < .01, Math.abs(after.y - before.y - 50) < .01,
+                new Document().caretPositionFromPoint(1, 12) === null, invalid];
+        })()"#).unwrap(), serde_json::json!([true, true, true, true, true, true, true, true]));
     }
 
     #[cfg(feature = "render")]
@@ -8011,6 +8133,138 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn inserting_a_frame_before_itself_retires_its_old_document_without_reordering() {
+        let mut rt = setup_runtime("<html><body><b id='before'></b><iframe id='frame'></iframe><b id='after'></b></body></html>");
+        rt.execute_script("frame-self-insertion", r#"
+            const frame = document.getElementById('frame');
+            const oldWindow = frame.contentWindow;
+            globalThis.oldSignal = oldWindow.AbortSignal.timeout(5);
+            globalThis.oldCalls = 0;
+            oldWindow.setTimeout(() => oldCalls++,5);
+            globalThis.sameNode = document.body.insertBefore(frame,frame) === frame;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("return {aborted:oldSignal.aborted, calls:oldCalls, sameNode, order:Array.from(document.body.children,node=>node.id)};").unwrap(),
+            serde_json::json!({"aborted":false,"calls":0,"sameNode":true,
+                "order":["before","frame","after"]}));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_frame_timers_do_not_run_after_their_document_is_destroyed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("frame-timer-lifetime", r#"
+            const retained = document.createElement('iframe');
+            document.body.appendChild(retained);
+            globalThis.retainedSignal = retained.contentWindow.AbortSignal.timeout(5);
+            globalThis.retainedTimers = 0;
+            retained.contentWindow.setTimeout(() => retainedTimers++,5);
+            globalThis.removedSignals = [];
+            globalThis.removedTimers = Array(8).fill(0);
+            globalThis.freshFrameTimers = [0,0,0];
+            globalThis.freshFrameWindows = [];
+            for (let i=0; i<8; i++) {
+                const container = document.createElement(i===2 ? 'iframe' : 'div');
+                document.body.appendChild(container);
+                const frame = (i===2 ? container.contentDocument : document).createElement('iframe');
+                (i===2 ? container.contentDocument.body : container).appendChild(frame);
+                const oldWindow = frame.contentWindow;
+                removedSignals.push(oldWindow.AbortSignal.timeout(5));
+                oldWindow.setTimeout(() => removedTimers[i]++,5);
+                if (i===0) frame.remove();
+                if (i===1 || i===2) container.remove();
+                if (i===3) container.innerHTML = '<p>replacement</p>';
+                if (i===4) container.textContent = 'replacement';
+                if (i===5) { frame.remove(); container.appendChild(frame); }
+                if (i===6) document.body.appendChild(frame);
+                if (i===7) container.appendChild(frame);
+                if (i>=5) {
+                    freshFrameWindows.push(frame.contentWindow !== oldWindow);
+                    frame.contentWindow.setTimeout(() => freshFrameTimers[i-5]++,5);
+                }
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("return {retainedSignal:retainedSignal.aborted, retainedTimers, \
+            removedSignals:removedSignals.map(signal=>signal.aborted), removedTimers, \
+            freshFrameTimers, freshFrameWindows};").unwrap();
+        assert_eq!(result, serde_json::json!({
+            "retainedSignal":true, "retainedTimers":1,
+            "removedSignals":[false,false,false,false,false,false,false,false],
+            "removedTimers":[0,0,0,0,0,0,0,0],
+            "freshFrameTimers":[1,1,1], "freshFrameWindows":[true,true,true],
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroying_a_child_document_cancels_its_pending_native_sleeps() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("frame-pending-timers", r#"
+            const frame = document.createElement('iframe');
+            document.body.appendChild(frame);
+            globalThis.oldFrame = frame.contentWindow;
+            globalThis.timerCalls = 0;
+            oldFrame.setTimeout(() => timerCalls++,60000);
+            oldFrame.setInterval(() => timerCalls++,60000);
+            frame.remove();
+        "#).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1),rt.run_event_loop())
+            .await.expect("Destroyed frame timers must not keep the native event loop alive")
+            .unwrap();
+        assert_eq!(rt.evaluate("return timerCalls;").unwrap().as_f64(),Some(0.0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_frame_teardown_does_not_panic_or_cancel_siblings_when_the_owner_is_borrowed() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("frame-owner-contention", r#"
+            globalThis.frameCalls = [0,0];
+            for (let i=0;i<2;i++) {
+                const frame = document.createElement('iframe');
+                document.body.appendChild(frame);
+                frame.contentWindow.setTimeout(() => frameCalls[i]++,5);
+            }
+        "#).unwrap();
+        let pending = rt.take_pending_frames().remove(0);
+        let doomed = crate::frame::FrameRealm::new(&mut rt,pending.frame_id,
+            pending.parent_frame_id,&pending.url,&pending.html).unwrap();
+        let owner = rt.state.clone();
+        let borrowed = owner.borrow_mut();
+        drop(doomed);
+        drop(borrowed);
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("return frameCalls;").unwrap(),serde_json::json!([0,1]));
+    }
+
+    #[test]
+    fn window_named_access_distinguishes_iframe_ids_from_child_context_names() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"(() => {
+            const byId = document.createElement('iframe'); byId.id = 'idOnlyFrame';
+            const collision = document.createElement('div'); collision.id = 'namedContext';
+            const first = document.createElement('iframe');
+            first.id = 'namedFrameId'; first.name = 'namedContext';
+            const second = document.createElement('iframe'); second.name = 'namedContext';
+            document.body.append(byId,collision,first,second);
+            const results = [window.idOnlyFrame===byId, window.namedFrameId===first,
+                window.namedContext===first.contentWindow];
+            first.remove();
+            results.push(window.namedContext===second.contentWindow);
+            second.remove();
+            results.push(window.namedContext===collision);
+            byId.name = 'idOnlyFrame';
+            results.push(window.idOnlyFrame===byId.contentWindow);
+            byId.removeAttribute('name');
+            results.push(window.idOnlyFrame===byId);
+            const duplicate = document.createElement('div'); duplicate.id = 'idOnlyFrame';
+            document.body.appendChild(duplicate);
+            results.push(window.idOnlyFrame instanceof HTMLCollection,
+                window.idOnlyFrame.length===2, window.idOnlyFrame[0]===byId);
+            return results;
+        })()"#).unwrap();
+        assert_eq!(result, serde_json::json!([true,true,true,true,true,true,true,true,true,true]));
+    }
+
     #[test]
     fn window_named_access_tracks_dynamic_ids_and_fragment_parsing() {
         let mut rt = setup_runtime("<html><body><div id='host'></div></body></html>");
@@ -8382,6 +8636,35 @@ mod tests {
         assert_eq!(result, serde_json::json!([
             [true, false, false, true, true, false, true],
             ["Visible label", "Input label"], "edited", true
+        ]));
+    }
+
+    #[test]
+    fn readonly_controls_reflect_boolean_attributes_without_polluting_other_elements() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            const enumerated = [];
+            const states = ['input', 'textarea'].map(tag => {
+                const field = document.createElement(tag);
+                const values = [[field.readOnly, field.getAttribute('readonly')]];
+                field.readOnly = true;
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                field.readOnly = false;
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                field.setAttribute('readonly', 'false');
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                field.removeAttribute('readonly');
+                values.push([field.readOnly, field.getAttribute('readonly')]);
+                for (const key in field) if (key === 'readOnly') enumerated.push(field[key]);
+                return values;
+            });
+            return [states, 'readOnly' in document.createElement('div'), enumerated];
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!([
+            [
+                [[false, null], [true, ""], [false, null], [true, "false"], [false, null]],
+                [[false, null], [true, ""], [false, null], [true, "false"], [false, null]]
+            ], false, [false, false]
         ]));
     }
 
@@ -18904,11 +19187,151 @@ mod tests {
     }
 
     #[test]
-    fn test_document_open_clears_body() {
-        let mut rt = setup_runtime("<html><body><p>Old content</p></body></html>");
-        rt.evaluate("document.open()").unwrap();
-        let html = rt.evaluate("document.body.innerHTML").unwrap();
-        assert_eq!(html.as_str().unwrap(), "");
+    fn document_open_removes_old_document_tree_before_writing() {
+        let mut rt = setup_runtime("<!doctype html><html><body><p>Old content</p></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const oldRoot = document.documentElement, oldType = document.doctype;
+            const opened = document.open();
+            return [opened === document, document.documentElement, document.head,
+                document.body, document.doctype, document.childNodes.length,
+                oldRoot.isConnected, oldType.isConnected];
+        })()"#).unwrap(), serde_json::json!([true, null, null, null, null, 0, false, false]));
+    }
+
+    #[test]
+    fn document_open_close_emits_the_empty_document_at_eof() {
+        let mut rt = setup_runtime("<html><body>old</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.open();
+            const emptyBeforeClose = document.childNodes.length === 0;
+            document.close();
+            return [emptyBeforeClose, document.documentElement.nodeName,
+                document.head.nodeName, document.body.nodeName, document.body.childNodes.length];
+        })()"#).unwrap(), serde_json::json!([true, "HTML", "HEAD", "BODY", 0]));
+    }
+
+    #[test]
+    fn document_open_close_retains_unclosed_script_without_running_it() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            globalThis.unclosedWriteRan = false;
+            document.open();
+            document.write('<script id="unclosed">globalThis.unclosedWriteRan = true;');
+            document.close();
+            return [document.getElementById('unclosed').parentNode.nodeName,
+                document.getElementById('unclosed').textContent, globalThis.unclosedWriteRan];
+        })()"#).unwrap(), serde_json::json!([
+            "HEAD", "globalThis.unclosedWriteRan = true;", false
+        ]));
+    }
+
+    #[test]
+    fn document_open_write_borrowed_methods_use_the_receiver_parser() {
+        let mut rt = setup_runtime("<html><body id='parent'>parent</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const childDocument = iframe.contentDocument;
+            Document.prototype.open.call(childDocument);
+            Document.prototype.write.call(childDocument, '<title>child</title><p id="written">value</p>');
+            Document.prototype.close.call(childDocument);
+            return [document.body.id, document.getElementById('written'),
+                childDocument.title, childDocument.getElementById('written').textContent,
+                childDocument.querySelector('title').parentNode.nodeName];
+        })()"#).unwrap(), serde_json::json!(["parent", null, "child", "value", "HEAD"]));
+    }
+
+    #[test]
+    fn document_open_write_uses_document_insertion_modes_across_calls() {
+        let mut rt = setup_runtime("<html><head><meta id='old'></head><body>old</body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.open();
+            document.write('<sty');
+            document.write('le id="written-style">body{margin:0}');
+            document.write('</style>\n      <input id="widget">');
+            document.close();
+            const widget = document.getElementById('widget');
+            const range = document.createRange(); range.selectNode(widget);
+            return [document.getElementById('written-style').parentNode.nodeName,
+                Array.from(document.head.children, n => n.nodeName),
+                Array.from(document.body.childNodes, n => n.nodeName),
+                range.startContainer.nodeName, range.startOffset,
+                document.getElementById('old') === null];
+        })()"#).unwrap(), serde_json::json!(["HEAD", ["STYLE"], ["INPUT"], "BODY", 0, true]));
+    }
+
+    #[test]
+    fn document_open_write_preserves_explicit_document_structure() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.open();
+            document.write('<!doctype html><html lang="fr"><head><title>Written</title></head>');
+            document.write('<body id="written-body"><table><tr><td id="cell">value</td></tr></table></body></html>');
+            document.close();
+            return [document.querySelectorAll('html').length, document.querySelectorAll('head').length,
+                document.querySelectorAll('body').length, document.documentElement.lang,
+                document.body.id, document.querySelector('title').parentNode.nodeName,
+                document.getElementById('cell').parentNode.parentNode.nodeName,
+                Array.from(document.childNodes, n => n.nodeType)];
+        })()"#).unwrap(), serde_json::json!([1, 1, 1, "fr", "written-body", "HEAD", "TBODY", [10, 1]]));
+    }
+
+    #[test]
+    fn document_compat_mode_reads_the_parsed_document_mode() {
+        for (html, expected) in [
+            ("<p>quirks</p>", "BackCompat"),
+            ("<!doctype html><p>standards</p>", "CSS1Compat"),
+            ("<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 4.01 Transitional//EN\" \"http://www.w3.org/TR/html4/loose.dtd\"><p>limited</p>", "CSS1Compat"),
+        ] {
+            let mut rt = setup_runtime(html);
+            assert_eq!(rt.evaluate("document.compatMode").unwrap(), serde_json::json!(expected), "{html}");
+        }
+    }
+
+    #[test]
+    fn document_open_write_updates_quirks_mode_without_fragment_leaks() {
+        let mut rt = setup_runtime("<!doctype html><p>old</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const modes = [document.compatMode];
+            document.open(); modes.push(document.compatMode);
+            document.write('<p>new</p>'); modes.push(document.compatMode);
+            document.close(); modes.push(document.compatMode);
+            document.open(); modes.push(document.compatMode);
+            document.write('<!doctype html><p>standards</p>'); modes.push(document.compatMode);
+            document.close();
+            document.body.innerHTML = '<p>fragment</p>';
+            document.write('<span>fragment write</span>'); modes.push(document.compatMode);
+            return modes;
+        })()"#).unwrap(), serde_json::json!([
+            "CSS1Compat", "CSS1Compat", "BackCompat", "BackCompat",
+            "CSS1Compat", "CSS1Compat", "CSS1Compat"
+        ]));
+    }
+
+    #[test]
+    fn document_open_close_sets_quirks_mode_at_eof() {
+        let mut rt = setup_runtime("<!doctype html><p>old</p>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            document.open();
+            const before = document.compatMode;
+            document.close();
+            return [before, document.compatMode];
+        })()"#).unwrap(), serde_json::json!(["CSS1Compat", "BackCompat"]));
+    }
+
+    #[test]
+    fn document_compat_mode_borrowed_getter_uses_the_receiver_realm() {
+        let mut rt = setup_runtime("<!doctype html><body></body>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            const iframe = document.createElement('iframe');
+            document.body.appendChild(iframe);
+            const child = iframe.contentDocument;
+            Document.prototype.open.call(child);
+            Document.prototype.write.call(child, '<p>quirks</p>');
+            Document.prototype.close.call(child);
+            const getMode = Object.getOwnPropertyDescriptor(Document.prototype, 'compatMode').get;
+            return [getMode.call(child), document.compatMode];
+        })()"#).unwrap(), serde_json::json!(["BackCompat", "CSS1Compat"]));
     }
 
     #[test]
@@ -20253,6 +20676,117 @@ mod tests {
         assert_eq!(rt.get_network_response_body(&request_id).unwrap().body, "arrived");
     }
 
+    async fn assert_script_fetch_xhr_destinations(fulfilled: bool, stealth: bool) {
+        const BODY: &str = "globalThis.destinationLoaded = 1;";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        if fulfilled {
+            drop(listener);
+        } else {
+            std::thread::spawn(move || {
+                use std::io::{Read as _, Write as _};
+                for _ in 0..3 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = [0u8; 4096];
+                    stream.read(&mut request).unwrap();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", BODY.len(), BODY).unwrap();
+                }
+            });
+        }
+        let mut rt = redirect_runtime_for_origin(&origin);
+        #[cfg(feature = "stealth")]
+        if stealth {
+            rt.set_stealth_client(std::sync::Arc::new(obscura_net::StealthHttpClient::new(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+            )));
+        }
+        #[cfg(not(feature = "stealth"))]
+        assert!(!stealth);
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let callbacks = std::sync::Arc::new(obscura_net::CallbackRegistry::new());
+        let capture = requests.clone();
+        callbacks.add_request(std::sync::Arc::new(move |request| {
+            capture.lock().unwrap().push(request.resource_type);
+        }));
+        let capture = responses.clone();
+        callbacks.add_response(std::sync::Arc::new(move |request, _| {
+            capture.lock().unwrap().push(request.resource_type);
+        }));
+        rt.set_callbacks(callbacks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if fulfilled {
+            rt.set_intercept_tx(tx);
+            rt.set_intercept_enabled(true);
+        }
+        let load = rt.call_function_on_for_cdp(
+            r#"async () => {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = '/same.js';
+                    script.onload = resolve; script.onerror = reject;
+                    document.head.append(script);
+                });
+                const fetched = await (await fetch('/same.js', {resourceType: 'Script'})).text();
+                const xhrBody = await new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest(); xhr.open('GET', '/same.js');
+                    xhr.onload = () => resolve(xhr.responseText); xhr.onerror = reject; xhr.send();
+                });
+                return [globalThis.destinationLoaded, fetched, xhrBody];
+            }"#, None, &[], true, true,
+        );
+        let resolve = async {
+            let mut types = Vec::new();
+            if fulfilled {
+                for _ in 0..3 {
+                    let request = rx.recv().await.unwrap();
+                    types.push(request.resource_type);
+                    request.resolver.send(crate::ops::InterceptResolution::Fulfill {
+                        status: 200, headers: std::collections::HashMap::new(),
+                        body: BODY.to_string(), body_base64: String::new(),
+                    }).unwrap();
+                }
+            }
+            types
+        };
+        let (result, intercepted) = tokio::time::timeout(
+            std::time::Duration::from_secs(5), async { tokio::join!(load, resolve) },
+        ).await.expect("dynamic resources complete");
+        assert_eq!(result.unwrap().value.unwrap(), serde_json::json!([1, BODY, BODY]));
+        let events = rt.take_js_network_events();
+        assert_eq!(events.iter().map(|event| event.resource_type.as_str()).collect::<Vec<_>>(),
+            vec!["Script", "Fetch", "XHR"]);
+        for event in &events {
+            assert_eq!(rt.get_network_response_body(&event.request_id).unwrap().body, BODY);
+        }
+        if fulfilled {
+            assert_eq!(intercepted, vec!["Script", "Fetch", "XHR"]);
+            assert!(requests.lock().unwrap().is_empty());
+            assert!(responses.lock().unwrap().is_empty());
+        } else {
+            let expected = vec![obscura_net::ResourceType::Script, obscura_net::ResourceType::Fetch,
+                obscura_net::ResourceType::Xhr];
+            assert_eq!(*requests.lock().unwrap(), expected);
+            assert_eq!(*responses.lock().unwrap(), expected);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_resource_destinations_reach_network_events_and_callbacks() {
+        assert_script_fetch_xhr_destinations(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dynamic_resource_destinations_survive_interception_fulfillment() {
+        assert_script_fetch_xhr_destinations(true, false).await;
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_dynamic_resource_destinations_reach_network_events_and_callbacks() {
+        assert_script_fetch_xhr_destinations(false, true).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fetch_response_reports_the_final_redirect_url() {
         let mut rt = redirect_chain_runtime(3);
@@ -20976,6 +21510,67 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.value.unwrap(), serde_json::json!(true));
+    }
+
+    // Native compileStreaming reached deno_core's wasm streaming callback with
+    // no JS handler registered: a panic inside a V8 callback, which aborted
+    // the whole process.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wasm_compile_streaming_uses_response_array_buffer() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+                const module = await WebAssembly.compileStreaming(
+                    Promise.resolve(new Response(bytes)),
+                );
+                return module instanceof WebAssembly.Module;
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.value.unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_wasm_streaming_rejects_a_non_response_source() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]);
+                const names = [];
+                for (const call of [
+                    () => WebAssembly.compileStreaming(Promise.resolve(bytes)),
+                    () => WebAssembly.instantiateStreaming(Promise.resolve(bytes), {}),
+                ]) {
+                    try {
+                        await call();
+                        names.push("resolved");
+                    } catch (error) {
+                        names.push(error.name);
+                    }
+                }
+                return names;
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!(["TypeError", "TypeError"])
+        );
     }
 
     // body.offsetParent returned body itself, so walking offsetParent to
@@ -23000,6 +23595,104 @@ mod tests {
             result,
             serde_json::json!(r#"{"wrap":true,"inner":true,"nested":true}"#)
         );
+    }
+
+    #[test]
+    fn document_write_foster_parenting_preserves_order_and_mutation_records() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            var scriptTestSetup = true;
+            document.open();
+            document.write('<table id="table"><tr><td>cell');
+            const table = document.getElementById('table');
+            const label = node => node.nodeType === 3 ? node.data : node.nodeName;
+            const observer = new MutationObserver(() => {});
+            observer.observe(document.body, {childList: true});
+            document.write('</td></tr>outside<b>bold</b>tail</table><p>end</p>');
+            const added = observer.takeRecords().flatMap(record => Array.from(record.addedNodes, label));
+            observer.disconnect();
+            const order = Array.from(document.body.childNodes, label);
+            document.close();
+            return {order, added, sameTable: document.getElementById('table') === table};
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "order": ["outside", "B", "tail", "TABLE", "P"],
+            "added": ["outside", "B", "tail", "P"],
+            "sameTable": true,
+        }));
+    }
+
+    #[test]
+    fn document_write_foster_parenting_grows_the_existing_text_node() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt.evaluate(r#"
+            var scriptTestSetup = true;
+            document.open();
+            document.write('<table id="table"><tr><td>cell');
+            const table = document.getElementById('table');
+            document.write('</td></tr>outside<!--flush-->');
+            const text = document.body.firstChild;
+            const first = text.nodeType === 3 ? text.data : null;
+            document.write('more</table>');
+            const second = document.body.firstChild.nodeType === 3 ? document.body.firstChild.data : null;
+            const sameText = document.body.firstChild === text;
+            document.close();
+            return {first, second, sameText, sameTable: document.getElementById('table') === table};
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "first": "outside", "second": "outsidemore", "sameText": true, "sameTable": true,
+        }));
+    }
+
+    #[test]
+    fn document_write_foster_parenting_uses_the_live_anchor_parent() {
+        for moved in [false, true] {
+            let mut rt = setup_runtime("<html><body></body></html>");
+            rt.evaluate(&format!("globalThis.moveWrittenTable = {moved}")).unwrap();
+            let result = rt.evaluate(r#"
+                var scriptTestSetup = true;
+                document.open();
+                document.write('<table id="table"><tr><td>cell');
+                const table = document.getElementById('table');
+                let parent = document.body;
+                if (moveWrittenTable) {
+                    parent = document.createElement('div');
+                    document.body.appendChild(parent);
+                    parent.appendChild(table);
+                } else {
+                    table.remove();
+                }
+                const observer = new MutationObserver(() => {});
+                observer.observe(parent, {childList: true});
+                let error = null;
+                try { document.write('</td></tr>outside</table>'); }
+                catch (caught) { error = caught.name; }
+                const label = node => node.nodeType === 3 ? node.data : node.nodeName;
+                const added = observer.takeRecords().flatMap(record => Array.from(record.addedNodes, label));
+                observer.disconnect();
+                const order = Array.from(parent.childNodes, label);
+                document.close();
+                return {order, added, error, sameTable: moveWrittenTable ? parent.lastChild === table : table.parentNode === null};
+            "#).unwrap();
+            let order = if moved { vec!["outside", "TABLE"] } else { vec!["outside"] };
+            assert_eq!(result, serde_json::json!({
+                "order": order, "added": ["outside"], "error": null, "sameTable": true,
+            }));
+        }
+    }
+
+    #[test]
+    fn document_write_foster_parenting_keeps_the_inline_insertion_point() {
+        let mut rt = setup_runtime("<html><body><script id=writer></script></body></html>");
+        let result = rt.evaluate(r#"
+            var scriptTestSetup = true;
+            globalThis.__currentScriptNid = document.getElementById('writer')._nid;
+            document.write('<table id="table"><tr><td>cell');
+            document.write('</td></tr>outside</table><p>end</p>');
+            globalThis.__currentScriptNid = 0;
+            return Array.from(document.body.childNodes, node => node.nodeType === 3 ? node.data : node.nodeName);
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(["SCRIPT", "outside", "TABLE", "P"]));
     }
 
     // WebIDL puts interface operations on the interface prototype with
