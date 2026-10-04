@@ -1959,6 +1959,7 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
             "null".to_string()
         }
         "document_node_id" => dom.document().index().to_string(),
+        "document_compat_mode" => if dom.is_quirks() { "BackCompat" } else { "CSS1Compat" }.into(),
         "document_title" => {
             // The DOM is authoritative after parsing. In particular, script
             // changes through title.textContent must be reflected by
@@ -2471,26 +2472,36 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         // document.write() feeds the document's input stream, so the calls
         // share one parser and one tokenizer state. Returns the nodes that
         // became complete with this call, for the caller to run scripts among.
-        // Returns [[parent, node], …], parents before children. A `parent` of 0 means the node
+        // Returns [[parent, node, before], …], parents before children. A `parent` of -1 means the node
         // belongs at the insertion point, which the caller knows. Nothing is inserted here:
         // that must go through Node.appendChild on the JS side, because that call also reports
         // the mutation, registers window named access, and loads a written stylesheet.
-        "document_write" => {
+        "document_write" | "document_write_close" => {
             let mut slot = gs.write_stream.borrow_mut();
-            let stream = slot.get_or_insert_with(DocumentWriteStream::new);
-            let placements = stream.write(&arg2, dom);
+            let placements = if cmd == "document_write_close" {
+                let Some(mut stream) = slot.take() else { return "[]".into(); };
+                let placements = stream.close(dom);
+                // EOF in a script's text insertion mode marks it already started.
+                // Newly released scripts have no closing tag and must not execute.
+                gs.already_started_scripts.borrow_mut().extend(placements.iter()
+                    .filter(|p| node_is_script(dom, p.node)).map(|p| p.node));
+                placements
+            } else {
+                slot.get_or_insert_with(|| DocumentWriteStream::new(false)).write(&arg2, dom)
+            };
             if placements
                 .iter()
                 .any(|placement| node_is_script(dom, placement.node))
             {
                 gs.document_write_inserted_script.set(true);
             }
-            let pairs: Vec<[i32; 2]> = placements
+            let pairs: Vec<[i32; 3]> = placements
                 .iter()
                 .map(|placement| {
                     [
-                        placement.parent.map_or(0, |id| id.index() as i32),
+                        placement.parent.map_or(-1, |id| id.index() as i32),
                         placement.node.index() as i32,
+                        placement.before.map_or(-1, |id| id.index() as i32),
                     ]
                 })
                 .collect();
@@ -2498,7 +2509,8 @@ fn op_dom_inner(shared: SharedState, cmd: String, arg1: String, arg2: String) ->
         }
         // document.open() discards what the input stream holds and starts over.
         "document_write_reset" => {
-            *gs.write_stream.borrow_mut() = None;
+            dom.set_quirks(false);
+            *gs.write_stream.borrow_mut() = Some(DocumentWriteStream::new(true));
             gs.document_write_inserted_script.set(false);
             "true".into()
         }
@@ -5663,7 +5675,7 @@ fn op_initial_frame(
         {
             let parent = parent_state.borrow();
             child.dom = Some(obscura_dom::parse_html(
-                "<!DOCTYPE html><html><head></head><body></body></html>"));
+                "<html><head></head><body></body></html>"));
             child.frame_id = frame_id;
             child.about_base_url = document_base_url(&parent);
             child.inherited_origin = Some(parent.inherited_origin.clone().unwrap_or_else(|| {
