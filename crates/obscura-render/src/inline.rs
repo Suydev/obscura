@@ -1074,6 +1074,7 @@ const REPLACED_CONTEXT_BIT: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy)]
 struct ReplacedItem {
+    independent_axes: bool,
     intrinsic_width: Option<f32>,
     intrinsic_height: Option<f32>,
     preferred_width: Option<f32>,
@@ -1131,6 +1132,7 @@ impl ReplacedItem {
             })
             .unwrap_or(2.0);
         ReplacedItem {
+            independent_axes: false,
             intrinsic_width: intrinsic
                 .width
                 .filter(|width| width.is_finite() && *width > 0.0),
@@ -1210,6 +1212,12 @@ impl ReplacedItem {
     }
 
     fn size(self, known: taffy::Size<Option<f32>>) -> taffy::Size<f32> {
+        if self.independent_axes {
+            return taffy::Size {
+                width: known.width.or(self.intrinsic_width).unwrap_or(0.0),
+                height: known.height.or(self.intrinsic_height).unwrap_or(0.0),
+            };
+        }
         let (width, height) = match (known.width, known.height) {
             (Some(width), Some(height)) => (width, height),
             (Some(width), None) => (width, width / self.preferred_ratio),
@@ -1896,6 +1904,16 @@ impl TextEngine {
             crate::ReplacedIntrinsic::from_dimensions(width, height),
             style,
         )
+    }
+
+    pub(crate) fn register_native_control(
+        &mut self, width: f32, height: f32, style: &LayoutStyle,
+    ) -> usize {
+        let mut item = ReplacedItem::from_style(width, height, style);
+        item.independent_axes = true;
+        let index = self.replaced.len();
+        self.replaced.push(item);
+        REPLACED_CONTEXT_BIT | index
     }
 
     pub(crate) fn register_replaced_intrinsic(
