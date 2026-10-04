@@ -435,6 +435,20 @@ mod tests {
     }
 
     #[test]
+    fn fetched_frame_contexts_survive_runtime_teardown_under_gc_stress() {
+        crate::set_v8_flags("--stress-compaction --stress-marking=1");
+        for _ in 0..10 {
+            let mut parent = page("https://parent.example/page", "<html><body>Parent</body></html>");
+            let frame = FrameRealm::new(&mut parent, 1, 0, "https://parent.example/frame",
+                "<html><body>Child</body></html>").expect("frame realm");
+            assert_eq!(frame.evaluate(&mut parent, "document.body.textContent").unwrap(),
+                serde_json::json!("Child"));
+            drop(frame);
+            drop(parent);
+        }
+    }
+
+    #[test]
     fn frame_has_its_own_realm_dom_and_origin() {
         let mut parent = page(
             "https://parent.example/page",
