@@ -22,15 +22,24 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      - name: Build __clear_cache shim with the cross toolchain
+      # cross only wraps cargo subcommands, so compile the shim with zig cc
+      # instead of trying to shell into the cross container.
+      - name: Build __clear_cache shim (zig cc -> aarch64-linux-musl)
         run: |
           set -eux
-          CC_NAME=$(cross sh -c 'echo ${CC_aarch64_unknown_linux_musl:-aarch64-linux-musl-gcc}')
-          echo "cross C compiler: $CC_NAME"
-          cross sh -c "$CC_NAME -O2 -fno-stack-protector -ffreestanding -c $PWD/ci/clear_cache.c -o $PWD/clear_cache.o"
+          ZIG_VER=0.13.0
+          curl -fsSL "https://ziglang.org/download/${ZIG_VER}/zig-linux-x86_64-${ZIG_VER}.tar.xz" -o zig.tar.xz
+          tar xf zig.tar.xz
+          ZIG="$(ls -d zig-linux-*/ | head -1)zig"
+          "$ZIG" version
+          "$ZIG" cc -target aarch64-linux-musl -O2 -fno-stack-protector -ffreestanding \
+            -c ci/clear_cache.c -o clear_cache.o
           file clear_cache.o
-          # the symbol must actually be there, or the link will fail the same way
-          command -v llvm-nm >/dev/null && llvm-nm clear_cache.o | grep -i clear_cache || nm clear_cache.o | grep -i clear_cache
+          nm clear_cache.o | grep -i clear_cache
+
+      - name: Install cross
+        if: false
+        run: true
 
       - name: Build obscura
         env:
