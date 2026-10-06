@@ -6,6 +6,7 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'ci/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-musl.yml'
@@ -13,40 +14,44 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      TARGET: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: musl-${{ hashFiles('Cargo.lock') }}
+      - name: Build __clear_cache shim with the cross toolchain
+        run: |
+          set -eux
+          CC_NAME=$(cross sh -c 'echo ${CC_aarch64_unknown_linux_musl:-aarch64-linux-musl-gcc}')
+          echo "cross C compiler: $CC_NAME"
+          cross sh -c "$CC_NAME -O2 -fno-stack-protector -ffreestanding -c $PWD/ci/clear_cache.c -o $PWD/clear_cache.o"
+          file clear_cache.o
+          # the symbol must actually be there, or the link will fail the same way
+          command -v llvm-nm >/dev/null && llvm-nm clear_cache.o | grep -i clear_cache || nm clear_cache.o | grep -i clear_cache
 
-      # rusty_v8 150.4.0 ships librusty_v8_release_aarch64-unknown-linux-musl.a.gz,
-      # so V8 is prebuilt and no source build is needed.
-      - name: Build obscura for aarch64-unknown-linux-musl
+      - name: Build obscura
+        env:
+          RUSTFLAGS: -C link-arg=${{ github.workspace }}/clear_cache.o
         run: |
           cross build \
             --profile release-dist \
-            --target aarch64-unknown-linux-musl \
+            --target $TARGET \
             -p obscura-cli --bins \
             --no-default-features
 
       - name: Package
         run: |
+          set -eux
           mkdir -p dist
-          cp target/aarch64-unknown-linux-musl/release-dist/obscura dist/
-          cp target/aarch64-unknown-linux-musl/release-dist/obscura-worker dist/
+          cp target/$TARGET/release-dist/obscura dist/
+          cp target/$TARGET/release-dist/obscura-worker dist/
           chmod +x dist/obscura dist/obscura-worker
           ls -l dist/
-          file dist/obscura || true
-          patchelf --print-interpreter dist/obscura || true
+          file dist/obscura
+          echo "interpreter: $(patchelf --print-interpreter dist/obscura 2>/dev/null || echo '(static, none)')"
 
       - uses: actions/upload-artifact@v4
         with:
