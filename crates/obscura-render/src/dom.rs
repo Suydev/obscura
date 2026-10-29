@@ -14,6 +14,11 @@ use taffy::prelude::*;
 
 use crate::{Rect, to_taffy_style};
 
+pub(crate) fn word_spacing_advance(text: &str, spacing: f32) -> f32 {
+    if spacing == 0.0 { return 0.0; }
+    text.chars().filter(|c| matches!(c, ' ' | '\u{00a0}')).count() as f32 * spacing
+}
+
 /// Text width for layout. With the `paint` feature this is exact (real glyph
 /// metrics from the embedded font, shared with rasterization). Without it
 /// (layout-only builds, e.g. for `getBoundingClientRect`), fall back to a
@@ -28,9 +33,11 @@ fn text_width(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
 ) -> f32 {
     crate::paint::measure_text(text, size, is_bold, family)
         + text.chars().filter(|c| !c.is_control()).count() as f32 * letter_spacing
+        + word_spacing_advance(text, word_spacing)
 }
 
 #[cfg(not(feature = "paint"))]
@@ -40,6 +47,7 @@ fn text_width(
     is_bold: bool,
     _family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
 ) -> f32 {
     const AVG_CHAR_WIDTH_EM: f32 = 0.55;
     let chars = text.chars().filter(|c| !c.is_control()).count() as f32;
@@ -49,6 +57,7 @@ fn text_width(
     } else {
         glyph_width
     }) + chars * letter_spacing
+        + word_spacing_advance(text, word_spacing)
 }
 
 #[derive(Default)]
@@ -503,7 +512,7 @@ pub fn retained_attribute_mutation_kind(
             | "viewbox"
             | "width"
     ) || (local == "input" && matches!(name.as_str(), "size" | "type" | "value"))
-        || (local == "select" && name == "size")
+        || (matches!(local.as_str(), "select" | "font") && name == "size")
         || (local == "textarea" && matches!(name.as_str(), "cols" | "rows" | "wrap"))
         || matches!(name.as_str(), "dir" | "lang" | "xml:lang")
     {
@@ -1042,6 +1051,7 @@ impl DomLayout {
                 continue;
             };
             let visibility_hidden = style.visibility_hidden.unwrap_or(parent_state.0);
+            style.computed_visibility_hidden = visibility_hidden;
             let opacity_zero = parent_state.1 || style.opacity.is_some_and(|value| value <= 0.0);
             style.effectively_invisible = visibility_hidden || opacity_zero;
             if let Some(pseudo) = style.before_pseudo.as_deref_mut() {
@@ -1952,18 +1962,17 @@ fn sync_resolved_percentage_padding(
 }
 
 /// Taffy's flex stand-in for an inline formatting context can lose the
-/// block-axis percentage basis of an atomic containing block. This is most
-/// visible when the atomic box is floated: the float's synthetic placement
-/// wrapper has an indefinite block size, so a `height:100%` descendant
-/// collapses even though the float itself has a definite used height.
+/// block-axis percentage basis of its real containing block. Anonymous
+/// inline-run and float-placement wrappers have indefinite block sizes, so a
+/// `height:100%` descendant can collapse despite a definite containing block.
 ///
 /// Blink's `CalculateChildAvailableSize` and Gecko's `ReflowInput` both pass
 /// the containing block's used content-box block size to such descendants.
 /// Reify that basis after the preliminary layout, when min/max constraints and
 /// border-box edges are known exactly. Keep the repair to ordinary direct
-/// descendants of definite floated/inline-block containing blocks; grid-area,
-/// flex-item, positioned, and anonymous containing-block rules remain native.
-fn resolve_atomic_percentage_heights(
+/// descendants of atomic containing blocks or ordinary block children crossing
+/// anonymous inline wrappers. Grid-area, flex-item and positioned rules remain native.
+fn resolve_inline_percentage_heights(
     tree: &DomTree,
     taffy_tree: &mut TaffyTree<usize>,
     taffy_root: taffy::NodeId,
@@ -2000,13 +2009,16 @@ fn resolve_atomic_percentage_heights(
                     _ => None,
                 })
             });
-            let parent_is_definite_atomic = styles.get(&parent_id).is_some_and(|style| {
-                (style.float.is_some() || style.is_inline_block)
+            let parent_is_definite = styles.get(&parent_id).is_some_and(|style| {
+                (style.float.is_some() || style.is_inline_block
+                    || (style.display == crate::Display::Block
+                        && style.column_count.is_none()
+                        && taffy_tree.parent(node).is_some_and(|parent| !id_map.contains_key(&parent))))
                     && definite_height_nodes.contains(&parent_id)
                     && style.size_expressions[1].is_none()
             });
             if is_direct_dom_child
-                && parent_is_definite_atomic
+                && parent_is_definite
                 && containing_block_height.is_finite()
             {
                 if let Some(percent) = child_percent {
@@ -2119,6 +2131,9 @@ struct IfcRegistry {
     whole: HashMap<NodeId, usize>,
     runs: HashMap<NodeId, Vec<usize>>,
     word_items: HashMap<NodeId, Vec<usize>>,
+    /// Zero-sized inline placeholders retain out-of-flow source positions
+    /// without changing the real box's percentage containing block.
+    static_positions: HashMap<NodeId, taffy::NodeId>,
     generated: Vec<GeneratedBoxBuild>,
     /// Specified column widths per table grid node, from `<col>` elements and
     /// colspan-1 cells: `(px, percent)` per column index. Consumed by the
@@ -2207,16 +2222,24 @@ fn resolve_clip_rects(
     // This node's own translate joins the accumulation for its box and its
     // whole subtree (percentages resolve against its own border box).
     let (own_tx, own_ty) = styles.get(&id).map_or((0.0, 0.0), |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
-        resolved_own_translate(style, &rect, root_font_size, viewport)
+        if style.ignores_used_box_sizes() {
+            (0.0, 0.0)
+        } else {
+            let rect = rects.get(&id).copied().unwrap_or_default();
+            resolved_own_translate(style, &rect, root_font_size, viewport)
+        }
     });
     let (tx, ty) = (tx + own_tx, ty + own_ty);
     if tx != 0.0 || ty != 0.0 {
         translates.insert(id, (tx, ty));
     }
     let own_transform = styles.get(&id).map_or(crate::Affine2::IDENTITY, |style| {
-        let rect = rects.get(&id).copied().unwrap_or_default();
-        resolved_transform_matrix(style, &rect, root_font_size, viewport)
+        if style.ignores_used_box_sizes() {
+            crate::Affine2::IDENTITY
+        } else {
+            let rect = rects.get(&id).copied().unwrap_or_default();
+            resolved_transform_matrix(style, &rect, root_font_size, viewport)
+        }
     });
     let transform = parent_transform.then(own_transform);
     if !transform.is_identity() {
@@ -2394,9 +2417,38 @@ pub(crate) fn resolve_translate(d: crate::Dimension, basis: f32) -> f32 {
     }
 }
 
+/// https://html.spec.whatwg.org/multipage/rendering.html#rules-for-parsing-a-legacy-font-size
+fn legacy_font_size_hint(value: &str) -> Option<&'static str> {
+    let value = value.trim_start_matches(['\t', '\n', '\u{c}', '\r', ' ']);
+    let (base, sign, digits) = if let Some(digits) = value.strip_prefix('+') {
+        (3, 1, digits)
+    } else if let Some(digits) = value.strip_prefix('-') {
+        (3, -1, digits)
+    } else {
+        (0, 1, value)
+    };
+    let mut digits = digits.bytes().take_while(u8::is_ascii_digit);
+    let first = digits.next()?;
+    // Only the clamped 1..7 result matters, so arbitrarily long inputs cannot overflow.
+    let value = digits.fold((first - b'0').min(7) as i8, |value, digit| {
+        (value * 10 + (digit - b'0') as i8).min(7)
+    });
+    Some([
+        "font-size:x-small", "font-size:small", "font-size:medium",
+        "font-size:large", "font-size:x-large", "font-size:xx-large", "font-size:xxx-large",
+    ][((base + sign * value).clamp(1, 7) - 1) as usize])
+}
+
 /// Apply HTML presentational attributes at their cascade origin: above the UA
 /// defaults, but below every author stylesheet and style attribute.
 fn apply_presentational_hints(node: &obscura_dom::tree::Node, style: &mut crate::LayoutStyle) {
+    if node.as_element().is_some_and(|name| {
+        name.local.as_ref() == "font" && name.ns.as_ref() == "http://www.w3.org/1999/xhtml"
+    }) {
+        if let Some(hint) = node.get_attribute("size").and_then(legacy_font_size_hint) {
+            crate::style::apply_inline(style, hint);
+        }
+    }
     if let Some(direction) = node.get_attribute("dir") {
         style.direction = match direction.trim().to_ascii_lowercase().as_str() {
             "ltr" => Some(taffy::Direction::Ltr),
@@ -4489,88 +4541,196 @@ pub fn computed_style_without_layout(
     cache: &crate::css::StylesheetCache,
     property: &str,
 ) -> Option<HashMap<&'static str, String>> {
-    if !matches!(property, "display" | "float" | "clear" | "position" | "z-index"
-        | "visibility" | "pointer-events" | "opacity" | "background-color"
-        | "background-origin" | "background-clip" | "color")
-        || !tree.is_connected(id)
-    {
-        return None;
+    if !NonGeometricStyleCache::supports(property) { return None; }
+    NonGeometricStyleCache::new(tree, viewport, media_type, cache)?.resolve(tree, id, property)
+}
+
+/// Ancestor cascade shared by non-geometric reads in one unchanged JS task.
+/// The owner must discard it on document, style, viewport or media changes.
+#[cfg(feature = "paint")]
+pub struct NonGeometricStyleCache {
+    sheet: std::sync::Arc<crate::css::Stylesheet>,
+    viewport: (f32, f32),
+    quirks: bool,
+    has_container_queries: bool,
+    styles: HashMap<NodeId, crate::LayoutStyle>,
+    custom_properties: HashMap<NodeId, std::rc::Rc<HashMap<String, String>>>,
+    ancestors: HashMap<NodeId, (Option<f32>, bool, bool, bool)>,
+    path: Vec<NodeId>,
+}
+
+#[cfg(feature = "paint")]
+impl NonGeometricStyleCache {
+    pub fn supports(property: &str) -> bool {
+        matches!(property, "display" | "float" | "clear" | "position" | "z-index"
+            | "visibility" | "pointer-events" | "opacity" | "background-color"
+            | "background-origin" | "background-clip" | "color")
     }
-    let sources = document_stylesheet_sources(tree, viewport, media_type);
-    let sheet = cache.get(&sources, viewport, media_type)?;
-    let mut path = tree.ancestors(id);
-    path.reverse();
-    path.push(id);
-    if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)
-        || tree.borrow_node(*node).is_some_and(|node| {
-            node.as_element().is_some_and(|element| element.local.as_ref() == "input")
-                && node.get_attribute("type").is_some_and(|kind| kind.trim().eq_ignore_ascii_case("hidden"))
-        })) {
-        return None;
+
+    pub fn new(
+        tree: &DomTree,
+        viewport: (f32, f32),
+        media_type: crate::CssMediaType,
+        cache: &crate::css::StylesheetCache,
+    ) -> Option<Self> {
+        let sources = document_stylesheet_sources(tree, viewport, media_type);
+        let sheet = cache.get(&sources, viewport, media_type)?;
+        Some(Self::from_sheet(tree, viewport, sheet))
     }
-    let quirks = !tree.children(tree.document()).iter().any(|node| {
-        tree.borrow_node(*node).is_some_and(|node| {
-            matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
-        })
-    });
-    let mut matcher = tree.matcher();
-    let mut styles = HashMap::new();
-    let mut custom_properties = HashMap::new();
-    let mut props = std::rc::Rc::new(HashMap::new());
-    let mut cell_padding = None;
-    let mut dark = false;
-    let mut color = None;
-    let mut pointer_events = false;
-    let shadow_sheets = HashMap::new();
-    let mut timeline = crate::AnimationTimelineState::default();
-    let mut ancestor_display_none = false;
-    for &node in &path {
-        let (next_props, next_padding, next_dark, element) = cascade_node_style(
-            tree, node, &sheet, &sheet, &shadow_sheets, &mut matcher,
-            &mut styles, &mut custom_properties, &props, &mut None, quirks,
-            viewport, crate::AnimationSample::default(), &mut timeline,
-            cell_padding, dark, None, ancestor_display_none,
-        )?;
-        props = next_props;
-        cell_padding = next_padding;
-        dark = next_dark;
-        if !element { continue; }
-        matcher.push_ancestor(tree, node);
-        let style = styles.get_mut(&node)?;
-        ancestor_display_none |= style.display == crate::Display::None;
-        // Display inheritance and live effects retain the complete normalization
-        // path. A query cannot become active without a query container on this
-        // ancestor path, including named normal/style containers.
-        if style.display_inherit || style.animation_name.is_some()
-            || (sheet.has_container_queries()
-                && (style.container_type != crate::ContainerType::Normal
-                    || !style.container_names.is_empty()))
-        {
+
+    fn from_sheet(tree: &DomTree, viewport: (f32, f32), sheet: std::sync::Arc<crate::css::Stylesheet>) -> Self {
+        let quirks = !tree.children(tree.document()).iter().any(|node| {
+            tree.borrow_node(*node).is_some_and(|node| {
+                matches!(node.data, obscura_dom::tree::NodeData::Doctype { .. })
+            })
+        });
+        Self {
+            has_container_queries: sheet.has_container_queries(), sheet, viewport, quirks,
+            styles: HashMap::new(), custom_properties: HashMap::new(), ancestors: HashMap::new(),
+            path: Vec::new(),
+        }
+    }
+
+    pub fn resolve(
+        &mut self, tree: &DomTree, id: NodeId, property: &str,
+    ) -> Option<HashMap<&'static str, String>> {
+        self.resolve_style(tree, id, property).map(crate::paint::non_geometric_computed_style)
+    }
+
+    fn resolve_style(
+        &mut self, tree: &DomTree, id: NodeId, property: &str,
+    ) -> Option<&crate::LayoutStyle> {
+        if !Self::supports(property) || !tree.is_connected(id) {
             return None;
         }
-        color = style.color.or(color);
-        style.color = color;
-        pointer_events = style.pointer_events_none.unwrap_or(pointer_events);
-        style.pointer_events_none = Some(pointer_events);
-    }
-    // Use the same outer-display fixup as layout, including transparent
-    // display:contents ancestors and flex/grid items.
-    let mut parent_is_item_container = false;
-    let mut root = true;
-    for node in path {
-        let Some(style) = styles.get_mut(&node) else { continue };
-        if root || (parent_is_item_container && !style.display_contents)
-            || style.position == Some(taffy::Position::Absolute) || style.float.is_some()
-        {
-            crate::blockify_outer_display(style);
+        if self.ancestors.contains_key(&id) {
+            return self.styles.get(&id);
         }
-        root = false;
-        if !style.display_contents {
-            parent_is_item_container = style.display == crate::Display::Grid
-                || (style.display == crate::Display::Flex && !style.internal_flex_container);
+        let mut path = tree.ancestors(id);
+        path.reverse();
+        path.push(id);
+        if path.iter().any(|node| tree.shadow_root(*node).is_some() || tree.is_shadow_root(*node)) {
+            return None;
         }
+        // Completed branches need their computed values, not another retained
+        // copy of each inherited custom-property environment.
+        let common = self.path.iter().zip(&path).take_while(|(old, new)| old == new).count();
+        for previous in self.path.drain(common..) {
+            self.custom_properties.remove(&previous);
+        }
+        self.path.extend_from_slice(&path[common..]);
+        let mut matcher = tree.matcher();
+        let mut props = std::rc::Rc::new(HashMap::new());
+        let mut cell_padding = None;
+        let mut dark = false;
+        let mut color = None;
+        let mut pointer_events = false;
+        let mut visibility_hidden = false;
+        let shadow_sheets = HashMap::new();
+        let mut timeline = crate::AnimationTimelineState::default();
+        let mut ancestor_display_none = false;
+        let mut parent_is_item_container = false;
+        let mut root = true;
+        for &node in &path {
+            if let Some(&(padding, scheme, hidden, item_container)) = self.ancestors.get(&node)
+                .filter(|_| self.custom_properties.contains_key(&node))
+            {
+                props = self.custom_properties.get(&node)?.clone();
+                cell_padding = padding;
+                dark = scheme;
+                ancestor_display_none = hidden;
+                parent_is_item_container = item_container;
+                let style = self.styles.get(&node)?;
+                color = style.color;
+                pointer_events = style.pointer_events_none.unwrap_or(false);
+                visibility_hidden = style.computed_visibility_hidden;
+                root = false;
+                matcher.push_ancestor(tree, node);
+                continue;
+            }
+            let (next_props, next_padding, next_dark, element) = cascade_node_style(
+                tree, node, &self.sheet, &self.sheet, &shadow_sheets, &mut matcher,
+                &mut self.styles, &mut self.custom_properties, &props, &mut None, self.quirks,
+                self.viewport, crate::AnimationSample::default(), &mut timeline,
+                cell_padding, dark, None, ancestor_display_none,
+            )?;
+            props = next_props;
+            cell_padding = next_padding;
+            dark = next_dark;
+            if !element { continue; }
+            matcher.push_ancestor(tree, node);
+            let style = self.styles.get_mut(&node)?;
+            // Native-control normalization hides this input even against
+            // author display declarations; no intrinsic geometry is needed.
+            if tree.with_node(node, |node| {
+                node.as_element().is_some_and(|element| element.local.as_ref() == "input")
+                    && node.get_attribute("type").is_some_and(|kind| kind.trim().eq_ignore_ascii_case("hidden"))
+            }).unwrap_or(false) {
+                style.display = crate::Display::None;
+            }
+            ancestor_display_none |= style.display == crate::Display::None;
+            // Display inheritance and live effects retain the complete normalization
+            // path. A query cannot become active without a query container on this
+            // ancestor path, including named normal/style containers.
+            if style.display_inherit || style.animation_name.as_deref().is_some_and(|name| {
+                self.sheet.animation_affects_non_geometric_style(name)
+            })
+                || (self.has_container_queries
+                    && (style.container_type != crate::ContainerType::Normal
+                        || !style.container_names.is_empty()))
+            {
+                return None;
+            }
+            color = style.color.or(color);
+            style.color = color;
+            pointer_events = style.pointer_events_none.unwrap_or(pointer_events);
+            style.pointer_events_none = Some(pointer_events);
+            visibility_hidden = style.visibility_hidden.unwrap_or(visibility_hidden);
+            style.computed_visibility_hidden = visibility_hidden;
+            // Normalize before retaining an ancestor for its next descendant.
+            if root || (parent_is_item_container && !style.display_contents)
+                || style.position == Some(taffy::Position::Absolute) || style.float.is_some()
+            {
+                crate::blockify_outer_display(style);
+            }
+            root = false;
+            if !style.display_contents {
+                parent_is_item_container = style.display == crate::Display::Grid
+                    || (style.display == crate::Display::Flex && !style.internal_flex_container);
+            }
+            self.ancestors.insert(node, (cell_padding, dark, ancestor_display_none, parent_is_item_container));
+        }
+        self.styles.get(&id)
     }
-    Some(crate::paint::non_geometric_computed_style(styles.get(&id)?))
+}
+
+/// Read display/visibility without retaining geometry or styles for completed branches.
+/// Unsupported cascade dependencies leave the full renderer as the authority.
+#[cfg(feature = "paint")]
+pub fn accessibility_styles_without_layout(
+    tree: &DomTree,
+    viewport: (f32, f32),
+    media_type: crate::CssMediaType,
+    cache: &crate::css::StylesheetCache,
+) -> Option<HashMap<NodeId, (bool, Option<bool>)>> {
+    let sources = document_stylesheet_sources(tree, viewport, media_type);
+    // This document-wide read checks every animation owner before returning.
+    // Keep ordinary CSSOM cold-read behavior and retained-layout keys unchanged.
+    let sheet = cache.get(&sources, viewport, media_type).unwrap_or_else(|| std::sync::Arc::new(
+        crate::css::Stylesheet::parse_for_viewport_and_media(tree, &sources, viewport, media_type),
+    ));
+    let mut cascade = NonGeometricStyleCache::from_sheet(tree, viewport, sheet);
+    let mut result = HashMap::new();
+    for id in tree.descendants(tree.document()) {
+        if !tree.with_node(id, |node| node.is_element()).unwrap_or(false) { continue; }
+        let style = cascade.resolve_style(tree, id, "visibility")?;
+        if style.animation_name.is_some() { return None; }
+        result.insert(id, (style.display == crate::Display::None, style.visibility_hidden));
+        let path = &cascade.path;
+        cascade.styles.retain(|id, _| path.contains(id));
+        cascade.ancestors.retain(|id, _| path.contains(id));
+    }
+    Some(result)
 }
 
 fn document_stylesheet_sources(
@@ -5176,6 +5336,7 @@ fn layout_dom_once(
             flow_root: bool,
             is_table_box: bool,
             is_table_cell_box: bool,
+            table_row_display: Option<crate::TableRowDisplay>,
             color: Option<[u8; 4]>,
             font_size: Option<f32>,
             font_weight: u16,
@@ -5183,6 +5344,7 @@ fn layout_dom_once(
             font_optical_sizing: crate::FontOpticalSizing,
             font_variation_settings: Vec<crate::FontVariationSetting>,
             letter_spacing: f32,
+            word_spacing: f32,
             letter_spacing_non_normal: bool,
             container_type: crate::ContainerType,
             containment: u8,
@@ -5238,6 +5400,7 @@ fn layout_dom_once(
                     flow_root: false,
                     is_table_box: false,
                     is_table_cell_box: false,
+                    table_row_display: None,
                     color: None,
                     font_size: None,
                     font_weight: 400,
@@ -5245,6 +5408,7 @@ fn layout_dom_once(
                     font_optical_sizing: crate::FontOpticalSizing::Auto,
                     font_variation_settings: Vec::new(),
                     letter_spacing: 0.0,
+                    word_spacing: 0.0,
                     letter_spacing_non_normal: false,
                     container_type: crate::ContainerType::Normal,
                     containment: 0,
@@ -5362,6 +5526,7 @@ fn layout_dom_once(
                     inh.flow_root = style.flow_root;
                     inh.is_table_box = style.is_table_box;
                     inh.is_table_cell_box = style.is_table_cell_box;
+                    inh.table_row_display = style.table_row_display;
                     inh.color = style.color.or(inh.color);
                     inh.font_size = style.font_size.or(inh.font_size);
                     inh.font_weight = crate::style::used_font_weight(style);
@@ -5376,6 +5541,9 @@ fn layout_dom_once(
                     }
                     if let Some(spacing) = style.letter_spacing {
                         inh.letter_spacing = spacing;
+                    }
+                    if let Some(spacing) = style.word_spacing {
+                        inh.word_spacing = spacing;
                     }
                     if let Some(non_normal) = style.letter_spacing_non_normal {
                         inh.letter_spacing_non_normal = non_normal;
@@ -5539,6 +5707,7 @@ fn layout_dom_once(
                     style.flow_root = inh.flow_root;
                     style.is_table_box = inh.is_table_box;
                     style.is_table_cell_box = inh.is_table_cell_box;
+                    style.table_row_display = inh.table_row_display;
                     // Reconstruct the internal cell-content wrapper only when
                     // the inherited computed display is table-cell.
                     style.internal_flex_container = style.is_table_cell_box;
@@ -5559,6 +5728,7 @@ fn layout_dom_once(
                 inh.flow_root = style.flow_root;
                 inh.is_table_box = style.is_table_box;
                 inh.is_table_cell_box = style.is_table_cell_box;
+                inh.table_row_display = style.table_row_display;
                 match style.color {
                     Some(c) => inh.color = Some(c),
                     None => style.color = inh.color,
@@ -5602,6 +5772,16 @@ fn layout_dom_once(
                 match style.letter_spacing {
                     Some(spacing) if spacing.is_finite() => inh.letter_spacing = spacing,
                     _ => style.letter_spacing = Some(inh.letter_spacing),
+                }
+                if let Some(raw) = style.word_spacing_raw {
+                    style.word_spacing = match raw.resolve(em_px, root_fs, vw, vh) {
+                        crate::Dimension::Px(pixels) if pixels.is_finite() => Some(pixels),
+                        _ => None,
+                    };
+                }
+                match style.word_spacing {
+                    Some(spacing) if spacing.is_finite() => inh.word_spacing = spacing,
+                    _ => style.word_spacing = Some(inh.word_spacing),
                 }
                 match style.letter_spacing_non_normal {
                     Some(non_normal) => inh.letter_spacing_non_normal = non_normal,
@@ -5861,6 +6041,7 @@ fn layout_dom_once(
                     None => style.text_indent = Some(inh.text_indent),
                 }
                 inh.visibility_hidden = style.visibility_hidden.unwrap_or(inh.visibility_hidden);
+                style.computed_visibility_hidden = inh.visibility_hidden;
                 match style.pointer_events_none {
                     Some(value) => inh.pointer_events_none = value,
                     None => style.pointer_events_none = Some(inh.pointer_events_none),
@@ -5994,6 +6175,7 @@ fn layout_dom_once(
                 // now-final computed style.
                 let host_color = style.color;
                 let host_font_size = style.font_size.unwrap_or(parent_fs);
+                let host_word_spacing = style.word_spacing.unwrap_or(0.0);
                 let host_letter_spacing = style.letter_spacing.unwrap_or(0.0);
                 let host_letter_spacing_non_normal =
                     style.letter_spacing_non_normal.unwrap_or(false);
@@ -6018,6 +6200,7 @@ fn layout_dom_once(
                 let host_flow_root = style.flow_root;
                 let host_is_table_box = style.is_table_box;
                 let host_is_table_cell_box = style.is_table_cell_box;
+                let host_table_row_display = style.table_row_display;
                 let host_grid_auto_columns = style.grid_auto_columns.clone();
                 let host_grid_auto_rows = style.grid_auto_rows.clone();
                 let host_grid_auto_column_calcs = style.grid_calc_expressions[2].clone();
@@ -6046,6 +6229,7 @@ fn layout_dom_once(
                         pseudo.flow_root = host_flow_root;
                         pseudo.is_table_box = host_is_table_box;
                         pseudo.is_table_cell_box = host_is_table_cell_box;
+                        pseudo.table_row_display = host_table_row_display;
                         pseudo.internal_flex_container = pseudo.is_table_cell_box;
                         if pseudo.is_table_cell_box {
                             pseudo.flex_direction = Some(taffy::FlexDirection::Column);
@@ -6096,6 +6280,14 @@ fn layout_dom_once(
                         };
                     } else if pseudo.letter_spacing.is_none() {
                         pseudo.letter_spacing = Some(host_letter_spacing);
+                    }
+                    if let Some(raw) = pseudo.word_spacing_raw {
+                        pseudo.word_spacing = match raw.resolve(pseudo_em, root_fs, vw, vh) {
+                            crate::Dimension::Px(pixels) if pixels.is_finite() => Some(pixels),
+                            _ => None,
+                        };
+                    } else if pseudo.word_spacing.is_none() {
+                        pseudo.word_spacing = Some(host_word_spacing);
                     }
                     if pseudo.letter_spacing_non_normal.is_none() {
                         pseudo.letter_spacing_non_normal = Some(host_letter_spacing_non_normal);
@@ -6380,6 +6572,7 @@ fn layout_dom_once(
                     bold,
                     style.font_family.as_deref(),
                     style.letter_spacing.unwrap_or(0.0),
+                    style.word_spacing.unwrap_or(0.0),
                 );
                 content_width += intrinsic_content
                     .map(|content| content.atomic_width)
@@ -6450,6 +6643,7 @@ fn layout_dom_once(
                             bold,
                             style.font_family.as_deref(),
                             style.letter_spacing.unwrap_or(0.0),
+                            style.word_spacing.unwrap_or(0.0),
                         )
                     })
                     .fold(0.0f32, f32::max);
@@ -6812,15 +7006,13 @@ fn layout_dom_once(
                 initial_containing_block,
                 &id_map,
                 &styles,
+                &ifc_items.static_positions,
             );
             let available = taffy::Size {
                 width: taffy::AvailableSpace::Definite(initial_cb_width),
                 height: taffy::AvailableSpace::Definite(viewport.1),
             };
-            #[cfg(feature = "paint")]
-            {
-                let engine = &mut engine;
-                let mut measure = |known: taffy::Size<Option<f32>>,
+            let mut measure = |known: taffy::Size<Option<f32>>,
                                    avail: taffy::Size<taffy::AvailableSpace>,
                                    _node,
                                    ctx: Option<&mut usize>,
@@ -6830,6 +7022,9 @@ fn layout_dom_once(
                         None => taffy::Size::ZERO,
                     }
                 };
+
+            #[cfg(feature = "paint")]
+            {
 
                 // Table used-width pass. A grid table is built at width:auto, so
                 // its final width has to be chosen the way CSS chooses a table's
@@ -7242,7 +7437,7 @@ fn layout_dom_once(
                     let _ =
                         taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if resolve_atomic_percentage_heights(
+                if resolve_inline_percentage_heights(
                     tree,
                     &mut taffy_tree,
                     taffy_root,
@@ -7359,7 +7554,7 @@ fn layout_dom_once(
             }
             #[cfg(not(feature = "paint"))]
             {
-                let _ = taffy_tree.compute_layout(taffy_root, available);
+                let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 if deferred_cyclic_inline_sizes.is_empty()
                     && apply_fit_content_widths(
                         &mut taffy_tree,
@@ -7367,21 +7562,22 @@ fn layout_dom_once(
                         &styles,
                         initial_cb_width,
                         |tree, node, width| {
-                            tree.compute_layout(
+                            tree.compute_layout_with_measure(
                                 node,
                                 taffy::Size {
                                     width,
                                     height: taffy::AvailableSpace::MaxContent,
                                 },
+                                &mut measure,
                             )
                             .ok()?;
                             tree.layout(node).ok().map(|layout| layout.size.width)
                         },
                     )
                 {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
-                if resolve_atomic_percentage_heights(
+                if resolve_inline_percentage_heights(
                     tree,
                     &mut taffy_tree,
                     taffy_root,
@@ -7389,11 +7585,11 @@ fn layout_dom_once(
                     &styles,
                     &definite_height_nodes,
                 ) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if repair_intrinsic_column_flex_negative_margins(&mut taffy_tree, &id_map, &styles)
                 {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 let _ = resolve_deferred_flex_inline_sizes(
                     tree,
@@ -7406,7 +7602,7 @@ fn layout_dom_once(
                     vh,
                     |tree, resolved_styles, phase| match phase {
                         DeferredFlexReflowPhase::Layout => {
-                            let _ = tree.compute_layout(taffy_root, available);
+                            let _ = tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                         }
                         DeferredFlexReflowPhase::FitContent => {
                             if apply_fit_content_widths(
@@ -7415,30 +7611,31 @@ fn layout_dom_once(
                                 resolved_styles,
                                 initial_cb_width,
                                 |tree, node, width| {
-                                    tree.compute_layout(
+                                    tree.compute_layout_with_measure(
                                         node,
                                         taffy::Size {
                                             width,
                                             height: taffy::AvailableSpace::MaxContent,
                                         },
+                                        &mut measure,
                                     )
                                     .ok()?;
                                     tree.layout(node).ok().map(|layout| layout.size.width)
                                 },
                             ) {
-                                let _ = tree.compute_layout(taffy_root, available);
+                                let _ = tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                             }
                         }
                     },
                 );
                 if apply_multicol_balance(&mut taffy_tree, &ifc_items.multicol) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_float_continuations(tree, &mut taffy_tree, &id_map, &styles, &ifc_items) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_table_row_geometry(&mut taffy_tree, &id_map, &styles, &ifc_items) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_full_span_column_subgrids(
                     tree,
@@ -7446,21 +7643,22 @@ fn layout_dom_once(
                     &id_map,
                     &styles,
                     |tree, node| {
-                        tree.compute_layout(
+                        tree.compute_layout_with_measure(
                             node,
                             taffy::Size {
                                 width: taffy::AvailableSpace::MaxContent,
                                 height: taffy::AvailableSpace::MaxContent,
                             },
+                            &mut measure,
                         )
                         .ok()?;
                         tree.layout(node).ok().map(|layout| layout.size.width)
                     },
                 ) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 if apply_table_cell_block_alignment(tree, &mut taffy_tree, &id_map, &styles) {
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
                 // Keep the no-paint geometry path in the same final-position
                 // contract as screenshots: static coordinates are resolved
@@ -7470,7 +7668,7 @@ fn layout_dom_once(
                         &mut taffy_tree,
                         &static_position_candidates,
                     );
-                    let _ = taffy_tree.compute_layout(taffy_root, available);
+                    let _ = taffy_tree.compute_layout_with_measure(taffy_root, available, &mut measure);
                 }
             }
             sync_resolved_percentage_padding(
@@ -7503,7 +7701,7 @@ fn layout_dom_once(
                 &mut generated_rects,
             );
             inline_fragments = synthesize_ordinary_inline_fragments(&mut rects, &styles, &engine);
-            synthesize_row_rects(tree, &mut rects);
+            synthesize_row_rects(tree, &styles, &mut rects);
         }
     }
     sync_positioned_pseudo_percentage_padding(&rects, &mut styles);
@@ -8796,6 +8994,7 @@ fn compute_absolute_rects(
 struct StaticPositionCandidate {
     child: taffy::NodeId,
     target: taffy::NodeId,
+    placeholder: Option<taffy::NodeId>,
     inline_axis: bool,
     block_axis: bool,
 }
@@ -8815,6 +9014,7 @@ fn reparent_inset_positioned_nodes(
     taffy_root: taffy::NodeId,
     id_map: &HashMap<taffy::NodeId, NodeId>,
     styles: &HashMap<NodeId, crate::LayoutStyle>,
+    static_positions: &HashMap<NodeId, taffy::NodeId>,
 ) -> Vec<StaticPositionCandidate> {
     let reverse: HashMap<NodeId, taffy::NodeId> = id_map
         .iter()
@@ -8871,13 +9071,15 @@ fn reparent_inset_positioned_nodes(
         let Some(current) = taffy_tree.parent(child) else {
             continue;
         };
-        if current == target {
+        let placeholder = static_positions.get(&dom_id).copied();
+        if current == target && placeholder.is_none() {
             continue;
         }
         if !has_block_inset || !has_inline_inset {
             static_candidates.push(StaticPositionCandidate {
                 child,
                 target,
+                placeholder,
                 inline_axis: !has_inline_inset,
                 block_axis: !has_block_inset,
             });
@@ -9628,7 +9830,9 @@ fn resolve_static_positions_and_reparent(
     // coordinates.
     let mut resolved = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let Some(child_origin) = taffy_global_origin(taffy_tree, candidate.child) else {
+        let Some(child_origin) = taffy_global_origin(
+            taffy_tree, candidate.placeholder.unwrap_or(candidate.child),
+        ) else {
             continue;
         };
         let Some(target_origin) = taffy_global_origin(taffy_tree, candidate.target) else {
@@ -9637,7 +9841,11 @@ fn resolve_static_positions_and_reparent(
         let Ok(child_layout) = taffy_tree.layout(candidate.child) else {
             continue;
         };
-        let child_margin = child_layout.margin;
+        let child_margin = if candidate.placeholder.is_some() {
+            taffy::Rect::ZERO
+        } else {
+            child_layout.margin
+        };
         let Ok(target_layout) = taffy_tree.layout(candidate.target) else {
             continue;
         };
@@ -10235,6 +10443,7 @@ fn build_text_words(
     let mut line_height = fsize * 1.2;
     let mut transform = crate::TextTransform::None;
     let mut letter_spacing = 0.0;
+    let mut word_spacing = 0.0;
     if let Some(parent_id) = rendered_parent(tree, id) {
         if let Some(p_style) = styles.get(&parent_id) {
             fsize = p_style.font_size.unwrap_or(16.0);
@@ -10243,6 +10452,7 @@ fn build_text_words(
             line_height = crate::inline::used_line_height(p_style);
             transform = p_style.text_transform.unwrap_or(crate::TextTransform::None);
             letter_spacing = p_style.letter_spacing.unwrap_or(0.0);
+            word_spacing = p_style.word_spacing.unwrap_or(0.0);
         }
     }
     if let Some(style) = rendered_parent(tree, id).and_then(|parent| styles.get(&parent)) {
@@ -10269,6 +10479,7 @@ fn build_text_words(
         is_bold,
         family,
         letter_spacing,
+        word_spacing,
         taffy_tree,
         words,
     )
@@ -10372,13 +10583,14 @@ fn build_word_leaves(
     is_bold: bool,
     family: Option<&str>,
     letter_spacing: f32,
+    word_spacing: f32,
     taffy_tree: &mut TaffyTree<usize>,
     words: &mut HashMap<taffy::NodeId, (NodeId, String)>,
 ) -> Vec<taffy::NodeId> {
     tokenize_with_spaces(text)
         .into_iter()
         .filter_map(|token| {
-            let width = text_width(&token, fsize, is_bold, family, letter_spacing);
+            let width = text_width(&token, fsize, is_bold, family, letter_spacing, word_spacing);
             // A pure-whitespace token is HTML source formatting or a bare
             // inter-element space; it keeps its (small) width so adjacent
             // inline content stays visually separated, but contributes no
@@ -10433,6 +10645,7 @@ fn build_pseudo_content(
         is_bold,
         style.font_family.as_deref(),
         style.letter_spacing.unwrap_or(0.0),
+        style.word_spacing.unwrap_or(0.0),
         taffy_tree,
         words,
     )
@@ -10554,28 +10767,22 @@ fn tokenize_with_spaces(text: &str) -> Vec<String> {
 /// extent must ignore the portion of a `rowspan` that continues through later
 /// rows. Nested-table cells must not participate at all. Sections are then the
 /// union of their already-synthesized direct rows.
-fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
+fn synthesize_row_rects(tree: &DomTree, styles: &HashMap<NodeId, crate::LayoutStyle>,
+    rects: &mut HashMap<NodeId, Rect>) {
     let mut rows = Vec::new();
     let mut sections = Vec::new();
     let mut table_inline: HashMap<NodeId, Rect> = HashMap::new();
+    let is_cell = |id| styles.get(&id).is_some_and(|style| style.is_table_cell_box)
+        || tree.with_node(id, |node| node.as_element().is_some_and(|name|
+            matches!(name.local.as_ref(), "td" | "th"))).unwrap_or(false);
     for id in rendered_descendants(tree, tree.document()) {
-        let local = match tree
-            .borrow_node(id)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()))
-        {
-            Some(l) => l,
-            None => continue,
-        };
-        match local.as_str() {
-            "tr" => rows.push(id),
-            "tbody" | "thead" | "tfoot" => sections.push(id),
-            "td" | "th" => {
+        match table_row_display(tree, id, styles) {
+            Some(crate::TableRowDisplay::Row) => rows.push(id),
+            Some(_) => sections.push(id),
+            None if is_cell(id) => {
                 let mut ancestor = rendered_parent(tree, id);
                 while let Some(parent) = ancestor {
-                    let is_table = tree.borrow_node(parent).map_or(false, |node| {
-                        node.as_element()
-                            .map_or(false, |element| element.local.as_ref() == "table")
-                    });
+                    let is_table = styles.get(&parent).is_some_and(|style| style.is_table_box);
                     if is_table {
                         if let Some(rect) = rects.get(&id) {
                             table_inline
@@ -10598,15 +10805,8 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
         }
         let mut inline: Option<Rect> = None;
         let mut block: Option<Rect> = None;
-        for cell in tree.children(id) {
-            let is_cell = tree
-                .borrow_node(cell)
-                .and_then(|n| {
-                    n.as_element()
-                        .map(|e| matches!(e.local.as_ref(), "td" | "th"))
-                })
-                .unwrap_or(false);
-            if !is_cell {
+        for cell in rendered_children(tree, id) {
+            if !is_cell(cell) {
                 continue;
             }
             let Some(r) = rects.get(&cell) else {
@@ -10658,11 +10858,8 @@ fn synthesize_row_rects(tree: &DomTree, rects: &mut HashMap<NodeId, Rect>) {
             continue;
         }
         let mut section: Option<Rect> = None;
-        for row in tree.children(id) {
-            let is_row = tree.borrow_node(row).map_or(false, |node| {
-                node.as_element()
-                    .map_or(false, |element| element.local.as_ref() == "tr")
-            });
+        for row in rendered_children(tree, id) {
+            let is_row = table_row_display(tree, row, styles) == Some(crate::TableRowDisplay::Row);
             if !is_row {
                 continue;
             }
@@ -11108,21 +11305,44 @@ where
     changed
 }
 
-/// Collect rows together with the exclusive end of their originating row
-/// group. HTML rowspans never cross a thead/tbody/tfoot boundary; `rowspan=0`
-/// means the remainder of that group, not the remainder of the whole table.
-fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)>) {
+fn table_row_display(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>)
+    -> Option<crate::TableRowDisplay> {
+    styles.get(&id).and_then(|style| style.table_row_display).or_else(|| {
+        // shortcut: preserve native display-override fixup until anonymous table boxes exist.
+        tree.with_node(id, |node| match node.as_element()?.local.as_ref() {
+            "tr" => Some(crate::TableRowDisplay::Row),
+            "tbody" => Some(crate::TableRowDisplay::Group),
+            "thead" => Some(crate::TableRowDisplay::Header),
+            "tfoot" => Some(crate::TableRowDisplay::Footer),
+            _ => None,
+        }).flatten()
+    })
+}
+
+/// Collect rows with the exclusive end of their originating group. Rowspans
+/// never cross a group boundary; rowspan=0 means the rest of that group.
+fn collect_table_rows(tree: &DomTree, id: NodeId, styles: &HashMap<NodeId, crate::LayoutStyle>,
+    rows: &mut Vec<(NodeId, usize)>) {
+    use crate::TableRowDisplay::{Row, Header, Footer};
     let mut direct_start: Option<usize> = None;
-    for cid in tree.children(id) {
-        let local = tree
-            .borrow_node(cid)
-            .and_then(|n| n.as_element().map(|e| e.local.to_string()));
-        match local.as_deref() {
-            Some("tr") => {
+    let children = rendered_children(tree, id);
+    let first_group = |role| children.iter().copied().find(|child| {
+        !styles.get(child).is_some_and(|style| style.display == crate::Display::None)
+            && table_row_display(tree, *child, styles) == Some(role)
+    });
+    let header = first_group(Header);
+    let footer = first_group(Footer);
+    for cid in header.into_iter().chain(children.iter().copied()
+        .filter(|child| Some(*child) != header && Some(*child) != footer)).chain(footer) {
+        if styles.get(&cid).is_some_and(|style| style.display == crate::Display::None) {
+            continue;
+        }
+        match table_row_display(tree, cid, styles) {
+            Some(Row) => {
                 direct_start.get_or_insert(rows.len());
                 rows.push((cid, 0));
             }
-            Some("thead") | Some("tbody") | Some("tfoot") => {
+            Some(_) => {
                 if let Some(start) = direct_start.take() {
                     let end = rows.len();
                     for entry in &mut rows[start..end] {
@@ -11130,11 +11350,9 @@ fn collect_table_rows(tree: &DomTree, id: NodeId, rows: &mut Vec<(NodeId, usize)
                     }
                 }
                 let start = rows.len();
-                for row in tree.children(cid) {
-                    if tree.borrow_node(row).is_some_and(|node| {
-                        node.as_element()
-                            .is_some_and(|element| element.local.as_ref() == "tr")
-                    }) {
+                for row in rendered_children(tree, cid) {
+                    if !styles.get(&row).is_some_and(|style| style.display == crate::Display::None)
+                        && table_row_display(tree, row, styles) == Some(Row) {
                         rows.push((row, 0));
                     }
                 }
@@ -11477,7 +11695,10 @@ fn build_table(
         node.as_element()
             .is_some_and(|element| element.local.as_ref() == "table")
     });
+    let mut rows: Vec<(NodeId, usize)> = Vec::new();
     let authored_row_children = if native_html_table {
+        collect_table_rows(tree, id, styles, &mut rows);
+        if rows.is_empty() { return None; }
         None
     } else {
         let children = rendered_children(tree, id);
@@ -11487,31 +11708,38 @@ fn build_table(
         // ordinary box construction preserves every child; partially taking
         // the dedicated path would silently discard direct text/non-cell
         // boxes once one real table cell made the build succeed.
-        let all_rendered_children_are_cells = flattened.iter().all(|child| {
-            let hidden = styles
-                .get(child)
-                .is_some_and(|child_style| child_style.display == crate::Display::None);
-            let ignorable_whitespace = tree.borrow_node(*child).is_some_and(|node| {
-                !node.is_element() && tree.text_content(*child).trim().is_empty()
+        let ignorable = |child: NodeId| {
+            styles.get(&child).is_some_and(|style| style.display == crate::Display::None)
+                || tree.with_node(child, |node| !node.is_element()
+                    && tree.text_content(child).trim().is_empty()).unwrap_or(false)
+        };
+        let all_rendered_children_are_cells = flattened.iter().all(|child|
+            ignorable(*child) || styles.get(child).is_some_and(|style| style.is_table_cell_box));
+        if all_rendered_children_are_cells {
+            Some(flattened)
+        } else {
+            let valid_row = |row| rendered_children(tree, row).into_iter().all(|child| {
+                ignorable(child) || styles.get(&child).is_some_and(|style| style.is_table_cell_box)
             });
-            hidden
-                || ignorable_whitespace
-                || styles
-                    .get(child)
-                    .is_some_and(|child_style| child_style.is_table_cell_box)
-        });
-        if !all_rendered_children_are_cells {
-            return None;
+            let valid = flattened.iter().copied().all(|child| {
+                if ignorable(child) { return true; }
+                match styles.get(&child).and_then(|style| style.table_row_display) {
+                    Some(crate::TableRowDisplay::Row) => valid_row(child),
+                    Some(_) => rendered_children(tree, child).into_iter().all(|row| {
+                        ignorable(row) || (styles.get(&row).is_some_and(|style|
+                            style.table_row_display == Some(crate::TableRowDisplay::Row)) && valid_row(row))
+                    }),
+                    None => false,
+                }
+            });
+            if !valid { return None; }
+            collect_table_rows(tree, id, styles, &mut rows);
+            if rows.is_empty() { return None; }
+            None
         }
-        Some(flattened)
     };
-    let mut rows: Vec<(NodeId, usize)> = Vec::new();
-    if native_html_table {
-        collect_table_rows(tree, id, &mut rows);
-        if rows.is_empty() {
-            return None;
-        }
-    } else {
+    let explicit_rows = authored_row_children.is_none();
+    if !explicit_rows {
         // CSS table fixup inserts an anonymous row around table-cell children
         // that are direct children of a table. The grid representation does
         // not need a material row node, but retaining one logical row gives
@@ -11547,8 +11775,8 @@ fn build_table(
     let mut ncols = 0usize;
     for (r, &(tr, group_end)) in rows.iter().enumerate() {
         let mut c = 0usize;
-        let row_children = if native_html_table {
-            tree.children(tr)
+        let row_children = if explicit_rows {
+            rendered_children(tree, tr)
         } else {
             authored_row_children.clone().unwrap_or_default()
         };
@@ -11820,7 +12048,7 @@ fn build_table(
     // Row sizing: a `height` on the row or a rowspan-1 cell is a MINIMUM
     // (content can always grow a row), matching how tables treat heights.
     let mut row_min: Vec<Option<f32>> = vec![None; nrows];
-    if native_html_table {
+    if explicit_rows {
         for (r, &(tr, _)) in rows.iter().enumerate() {
             if let Some(crate::Dimension::Px(h)) = styles.get(&tr).map(|s| s.height) {
                 if h > 0.0 {
@@ -12027,6 +12255,14 @@ fn assign_native_control_size(
 ) {
     let (stretch_inline, stretch_block) = stretched_grid_item;
     let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    if stretch_inline || stretch_block {
+        // Stretch controls the final size, not the intrinsic track contribution.
+        // Measure content axes independently; native controls have no natural ratio.
+        style.intrinsic_size = Some((
+            (intrinsic_width - horizontal_edges).max(0.0),
+            (intrinsic_height - vertical_edges).max(0.0),
+        ));
+    }
     if style.width == crate::Dimension::Auto && !stretch_inline {
         let declared = if content_box {
             (intrinsic_width - horizontal_edges).max(0.0)
@@ -12870,6 +13106,15 @@ fn build(
         }
     }
 
+    if matches!(_name.local.as_ref(), "input" | "select" | "textarea") {
+        if let Some((width, height)) = style.intrinsic_size {
+            let context = engine.register_native_control(width, height, style);
+            let leaf = taffy_tree.new_leaf_with_context(taffy_style, context).ok()?;
+            id_map.insert(leaf, id);
+            return Some(leaf);
+        }
+    }
+
     // An inline SVG is an atomic replaced box in the surrounding formatting
     // context. Its descendants paint inside its SVG viewport; they must not
     // become CSS layout children. In particular, a viewBox supplies an
@@ -13149,7 +13394,12 @@ fn build(
         // the CSS tie-break. Taffy has no CSS `order` style field, so feeding
         // it the correctly ordered item sequence is the missing translation.
         dom_children.sort_by_key(|cid| styles.get(cid).map(|style| style.order).unwrap_or(0));
-    } else if style.display == crate::Display::Block {
+    } else if style.display == crate::Display::Block
+        || (style.display == crate::Display::Inline && style.is_inline_block && !has_inline_ish_content)
+    {
+        // An inline-block's inner display is flow-root, so the same applies
+        // to formatting whitespace around its block children.
+        //
         // Formatting whitespace between block lines does not generate an
         // inline line box. Keeping a zero-height taffy leaf here still breaks
         // sibling margin adjacency, turning `margin-bottom:30px` followed by
@@ -13286,6 +13536,21 @@ fn build(
             };
         }
         taffy_style.align_items = Some(taffy::AlignItems::FLEX_START);
+    }
+
+    // An inline-block is a flow-root inside. With only block-level in-flow
+    // children there is no inline formatting context to emulate, so its
+    // children stack and stretch as in a block instead of sharing a row.
+    if style.display == crate::Display::Inline
+        && style.is_inline_block
+        && !has_inline_ish_content
+        && !native_float_band
+        && !has_float_child
+        && dom_children
+            .iter()
+            .any(|cid| styles.get(cid).is_some_and(is_in_flow_block_level))
+    {
+        taffy_style.display = taffy::style::Display::Block;
     }
 
     if native_float_band {
@@ -13522,9 +13787,9 @@ fn inline_wrapper_float(
 ///   word: faster and lighter than the old whole-container promotion). Runs
 ///   holding atomic inline boxes (img, inline-block, ...) fall back to an
 ///   anonymous flex-wrap wrapper around the run's boxes;
-/// - out-of-flow (absolutely positioned) children neither join nor break a
-///   run; they are appended after the flow children so their containing
-///   block is this parent, whose used width they resolve percentages against.
+/// - out-of-flow children do not break a run. Inline static-position markers
+///   retain their source position, while the real boxes remain direct children
+///   of this parent so percentages resolve against its containing block.
 #[allow(clippy::too_many_arguments)]
 fn build_mixed_block(
     tree: &DomTree,
@@ -13553,9 +13818,11 @@ fn build_mixed_block(
     enum Seg {
         Run(Vec<NodeId>),
         Block(NodeId),
+        OutOfFlow(NodeId),
     }
     let mut segs: Vec<Seg> = Vec::new();
     let mut out_of_flow: Vec<NodeId> = Vec::new();
+    let mut run_index = None;
     for &cid in &flat {
         let Some(node) = tree.borrow_node(cid) else {
             continue;
@@ -13576,22 +13843,36 @@ fn build_mixed_block(
                 continue;
             }
             if matches!(s.position, Some(taffy::Position::Absolute)) {
-                out_of_flow.push(cid);
-                continue;
+                if s.static_position_inline &&
+                    ((s.inset[0].is_none() && s.inset[2].is_none()) ||
+                     (s.inset[1].is_none() && s.inset[3].is_none()))
+                {
+                    out_of_flow.push(cid);
+                    true
+                } else {
+                    segs.push(Seg::OutOfFlow(cid));
+                    continue;
+                }
+            } else {
+                let is_forced_break = node
+                    .as_element()
+                    .map_or(false, |element| element.local.as_ref() == "br");
+                is_forced_break || crate::is_inline_level_box(s)
             }
-            let is_forced_break = node
-                .as_element()
-                .map_or(false, |element| element.local.as_ref() == "br");
-            is_forced_break || crate::is_inline_level_box(s)
         } else {
             false
         };
         if inline_level {
-            match segs.last_mut() {
-                Some(Seg::Run(run)) => run.push(cid),
-                _ => segs.push(Seg::Run(vec![cid])),
+            if let Some(index) = run_index {
+                if let Seg::Run(run) = &mut segs[index] {
+                    run.push(cid);
+                }
+            } else {
+                run_index = Some(segs.len());
+                segs.push(Seg::Run(vec![cid]));
             }
         } else {
+            run_index = None;
             segs.push(Seg::Block(cid));
         }
     }
@@ -13622,13 +13903,19 @@ fn build_mixed_block(
     let mut before_pending = !before_block && !before_leaves.is_empty();
     let mut after_pending = !after_block && !after_leaves.is_empty();
 
-    let n_segs = segs.len();
+    let first_flow = segs.iter().position(|seg| !matches!(seg, Seg::OutOfFlow(_)));
+    let last_flow = segs.iter().rposition(|seg| !matches!(seg, Seg::OutOfFlow(_)));
     let mut child_ids: Vec<taffy::NodeId> = Vec::new();
     if before_block {
         child_ids.extend(before_leaves.iter().copied());
     }
     for (i, seg) in segs.into_iter().enumerate() {
         match seg {
+            Seg::OutOfFlow(cid) => {
+                child_ids.extend(build_any(
+                    tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
+                ));
+            }
             Seg::Block(cid) => {
                 let built = build_any(
                     tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
@@ -13679,8 +13966,8 @@ fn build_mixed_block(
                     .map(|index| index + 1)
                     .unwrap_or(start);
                 let run = &run[start..end];
-                let join_before = before_pending && i == 0;
-                let join_after = after_pending && i + 1 == n_segs;
+                let join_before = before_pending && Some(i) == first_flow;
+                let join_after = after_pending && Some(i) == last_flow;
                 // Fast path: the whole run folds to one shaped leaf, unless
                 // pseudo-content word leaves must share its lines.
                 if !join_before && !join_after {
@@ -13699,6 +13986,21 @@ fn build_mixed_block(
                     before_pending = false;
                 }
                 for &rc in run {
+                    if styles.get(&rc).is_some_and(|s| {
+                        matches!(s.position, Some(taffy::Position::Absolute))
+                    }) {
+                        let placeholder = taffy_tree.new_leaf(taffy::Style {
+                            size: taffy::Size {
+                                width: taffy::Dimension::length(0.0),
+                                height: taffy::Dimension::length(0.0),
+                            },
+                            flex_shrink: 0.0,
+                            ..Default::default()
+                        }).ok()?;
+                        ifc_items.static_positions.insert(rc, placeholder);
+                        atoms.push(placeholder);
+                        continue;
+                    }
                     let is_forced_break = tree.borrow_node(rc).is_some_and(|node| {
                         node.as_element()
                             .is_some_and(|element| element.local.as_ref() == "br")
@@ -13952,10 +14254,10 @@ fn inline_wraps_only_in_flow_blocks(
 /// Recursively splice `display:contents`, decoration-free inline wrappers, and
 /// inline wrappers whose only generated flow content is block-level into a
 /// block container's effective child list. Descendants already carry inherited
-/// computed text styles, so removing these wrappers preserves shaping while
-/// exposing block-in-inline descendants early enough for anonymous block
-/// construction.
-fn flatten_boxless_inline_children(
+/// computed text styles. Preserve wrappers the text engine can fold so their
+/// shaped runs retain element geometry; expose block-in-inline descendants
+/// early enough for anonymous block construction.
+pub(crate) fn flatten_boxless_inline_children(
     tree: &DomTree,
     children: &[NodeId],
     styles: &HashMap<NodeId, crate::LayoutStyle>,
@@ -13970,6 +14272,14 @@ fn flatten_boxless_inline_children(
             || is_flattenable_inline(tree, cid, styles)
             || inline_wraps_only_in_flow_blocks(tree, cid, styles)
         {
+            #[cfg(feature = "paint")]
+            if !display_contents {
+                let mut has_text = false;
+                if crate::inline::inline_child_ok(tree, cid, styles, &mut has_text) {
+                    out.push(cid);
+                    continue;
+                }
+            }
             let kids = rendered_children(tree, cid);
             flatten_boxless_inline_children(tree, &kids, styles, out);
         } else {
@@ -15298,6 +15608,33 @@ mod tests {
     use obscura_dom::tree::ShadowRootMode;
     use obscura_dom::tree_sink::parse_html;
 
+    #[cfg(feature = "paint")]
+    #[test]
+    fn accessibility_style_reads_preserve_visibility_and_the_retained_cache_key() {
+        let tree = parse_html("<!doctype html><style>body{--conceal:hidden}.hidden{visibility:var(--conceal)}.shown{visibility:visible}.gone{display:none}</style><div class=hidden id=hidden><span class=shown id=shown>shown</span></div><div class=gone id=gone>gone</div>");
+        let sheets = crate::StylesheetCache::default();
+        let styles = accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &sheets).unwrap();
+        assert_eq!(styles[&tree.get_element_by_id("hidden").unwrap()].1, Some(true));
+        assert_eq!(styles[&tree.get_element_by_id("shown").unwrap()].1, Some(false));
+        assert!(styles[&tree.get_element_by_id("gone").unwrap()].0);
+        assert_eq!(sheets.retained_source_bytes(), 0, "a read must not bless an unrelated retained layout with a new stylesheet key");
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn accessibility_styles_decline_animations_containers_and_shadow_dependencies() {
+        for source in [
+            "<!doctype html><style>@keyframes move{to{transform:translateX(1px)}}#x{animation:move 1s infinite}</style><p id=x>animated</p>",
+            "<!doctype html><style>.c{container-type:inline-size}@container(min-width:1px){#x{visibility:hidden}}</style><div class=c><p id=x>query</p></div>",
+        ] {
+            let tree = parse_html(source);
+            assert!(accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &crate::StylesheetCache::default()).is_none(), "unsupported dependencies must use full preparation: {source}");
+        }
+        let tree = parse_html("<!doctype html><div id=host></div><section id=source><style>:host{display:none}</style></section>");
+        attach_programmatic_shadow(&tree, tree.get_element_by_id("host").unwrap(), tree.get_element_by_id("source").unwrap());
+        assert!(accessibility_styles_without_layout(&tree, (400.0,200.0), crate::CssMediaType::Screen, &crate::StylesheetCache::default()).is_none());
+    }
+
     fn attach_programmatic_shadow(tree: &DomTree, host: NodeId, source: NodeId) -> NodeId {
         let root = tree
             .attach_shadow_root(host, ShadowRootMode::Open)
@@ -15307,6 +15644,127 @@ mod tests {
         }
         tree.remove(source);
         root
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_keeps_custom_property_maps_on_the_active_path() {
+        let branches = (0..32).map(|i| {
+            format!("<section id=branch-{i} style='--local:rgb({i}, 0, 0)'><span id=leaf-{i}>leaf</span><span id=second-{i}>second</span></section>")
+        }).collect::<String>();
+        let tree = parse_html(&format!(r#"<!doctype html><style>body {{ --tone:blue }}
+            section {{ --local:red; color:var(--local) }}</style><body>{branches}</body>"#));
+        let mut sheets = crate::StylesheetCache::default();
+        let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+            &[], &mut sheets,
+        ).unwrap();
+        let mut cache = NonGeometricStyleCache::new(
+            &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+        ).unwrap();
+        for (i, prefix) in (0..32).map(|i| (i, "leaf"))
+            .chain((0..32).rev().map(|i| (i, "second")))
+        {
+            for name in [format!("{prefix}-{i}"), format!("branch-{i}")] {
+                let id = tree.get_element_by_id(&name).unwrap();
+                let result = cache.resolve(&tree, id, "color").unwrap();
+                assert_eq!(result["color"], full.computed_style(id).unwrap()["color"]);
+                assert!(cache.custom_properties.len() <= 4,
+                    "completed sibling branches must not retain inherited custom-property maps");
+            }
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_ignores_unrelated_animation_tracks() {
+        let tree = parse_html(r#"<!doctype html><style>
+            #moving { animation:move 1s linear infinite; color:blue }
+            #unknown { animation:missing 1s infinite }
+            #fading { animation:fade 1s infinite }
+            #color { animation:tint 1s infinite }
+            #visibility { animation:hide 1s infinite }
+            #mixed { animation:mixed 1s infinite }
+            @keyframes move { to { transform:translateX(40px); width:100px } }
+            @keyframes fade { to { opacity:0 } }
+            @keyframes tint { to { color:red; background-color:green } }
+            @keyframes hide { to { visibility:hidden } }
+            @keyframes mixed { to { transform:translateX(40px); opacity:0 } }
+        </style><div id=moving><span id=child>moving</span></div><div id=unknown>unknown</div>
+            <div id=fading>fade</div><div id=color>color</div><div id=visibility>visibility</div><div id=mixed>mixed</div>"#);
+        let mut sheets = crate::StylesheetCache::default();
+        for milliseconds in [0.0, 500.0, 1000.0] {
+            let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache_at_animation_time(
+                &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+                &[], &mut sheets, crate::AnimationSampleTime { milliseconds },
+            ).unwrap();
+            let mut cache = NonGeometricStyleCache::new(
+                &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+            ).unwrap();
+            for name in ["child", "moving", "unknown"] {
+                let id = tree.get_element_by_id(name).unwrap();
+                let result = cache.resolve(&tree, id, "display")
+                    .expect("unrelated keyframe tracks do not require layout");
+                let expected = full.computed_style(id).unwrap();
+                for (property, value) in result {
+                    assert_eq!(value, expected[property], "{name}.{property} at {milliseconds}");
+                }
+            }
+            for name in ["fading", "color", "visibility", "mixed"] {
+                assert!(cache.resolve(&tree, tree.get_element_by_id(name).unwrap(), "display").is_none(),
+                    "{name} animates a value included in the partial snapshot");
+            }
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_preserves_inherited_visibility_across_cached_branches() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { visibility:hidden }
+            #override { visibility:visible }
+            #opacity { visibility:visible; opacity:0 }
+        </style><span id=hidden>hidden</span><div id=override><span id=visible>visible</span></div><span id=opacity>transparent</span>"#);
+        let mut sheets = crate::StylesheetCache::default();
+        let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+            &[], &mut sheets,
+        ).unwrap();
+        let mut cache = NonGeometricStyleCache::new(
+            &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+        ).unwrap();
+        for (name, expected) in [("visible", "visible"), ("hidden", "hidden"), ("override", "visible"), ("opacity", "visible")] {
+            let id = tree.get_element_by_id(name).unwrap();
+            let result = cache.resolve(&tree, id, "visibility").unwrap();
+            assert_eq!(result["visibility"], expected, "{name}");
+            assert_eq!(result["visibility"], full.computed_style(id).unwrap()["visibility"]);
+        }
+    }
+
+    #[cfg(feature = "paint")]
+    #[test]
+    fn non_geometric_cssom_resolves_hidden_inputs_without_full_layout() {
+        let tree = parse_html(r#"<!doctype html><style>
+            body { color:blue; visibility:hidden; pointer-events:none }
+            input { display:block !important; background-color:red }
+        </style><input id=target type=hidden>"#);
+        let id = tree.get_element_by_id("target").unwrap();
+        let mut sheets = crate::StylesheetCache::default();
+        let full = crate::prepare_dom_with_dynamic_fonts_and_stylesheet_cache(
+            &tree, (400.0, 200.0), None, &mut crate::RenderResourceCache::default(),
+            &[], &mut sheets,
+        ).unwrap();
+        let mut cache = NonGeometricStyleCache::new(
+            &tree, (400.0, 200.0), crate::CssMediaType::Screen, &sheets,
+        ).unwrap();
+        let result = cache.resolve(&tree, id, "display").unwrap();
+        assert_eq!(result["display"], "none");
+        assert_eq!(result["visibility"], "hidden");
+        assert_eq!(result["color"], "rgb(0, 0, 255)");
+        let expected = full.computed_style(id).unwrap();
+        for (property, value) in result {
+            assert_eq!(value, expected[property], "hidden input {property}");
+        }
     }
 
     #[test]
@@ -19870,6 +20328,87 @@ mod tests {
         let tree = parse_html("");
         let laid = layout_dom(&tree, (1280.0, 720.0));
         assert!(laid.rects.len() <= 4, "got {}", laid.rects.len());
+    }
+
+    #[test]
+    fn legacy_font_size_hints_follow_numeric_rules_and_author_cascade() {
+        let cases = [
+            ("1", 10.0), ("2", 13.0), ("3", 16.0), ("4", 18.0),
+            ("5", 24.0), ("6", 32.0), ("7", 48.0), ("0", 10.0), ("8", 48.0),
+            ("+1", 18.0), ("-1", 13.0), ("-2", 10.0), ("+0", 16.0), ("-0", 16.0),
+            (" \t+2tail", 24.0), ("\n2", 13.0),
+            ("999999999999999999999999", 48.0), ("-999999999999999999999999", 10.0),
+            ("", 20.0), ("word", 20.0), ("+ 1", 20.0), ("- 1", 20.0), ("\u{a0}2", 20.0),
+        ];
+        let mut html = String::from("<!doctype html><style>html{font-size:16px}body{font-size:20px}#sheet{font-size:21px}</style>");
+        for (index, (size, _)) in cases.iter().enumerate() {
+            html.push_str(&format!("<font id=f{index} size='{size}'><span id=c{index}>x</span></font>"));
+        }
+        html.push_str("<font id=sheet size=1>x</font><font id=inline size=1 style='font-size:23px'>x</font><span id=ordinary size=1>x</span>");
+        let tree = parse_html(&html);
+        let laid = layout_dom(&tree, (640.0, 480.0));
+        for (index, (size, expected)) in cases.iter().enumerate() {
+            for id in [format!("f{index}"), format!("c{index}")] {
+                let node = tree.get_element_by_id(&id).unwrap();
+                assert_eq!(laid.styles[&node].font_size, Some(*expected), "{id}: size={size:?}");
+            }
+        }
+        for (id, expected) in [("sheet", 21.0), ("inline", 23.0), ("ordinary", 20.0)] {
+            let node = tree.get_element_by_id(id).unwrap();
+            assert_eq!(laid.styles[&node].font_size, Some(expected), "{id}");
+        }
+    }
+
+    #[test]
+    fn legacy_font_size_mutations_restyle_inherited_descendants() {
+        let tree = parse_html("<!doctype html><style>body{font-size:20px}</style><font id=font size=1><span id=child>x</span></font><aside>clean</aside>");
+        let font = tree.get_element_by_id("font").unwrap();
+        let child = tree.get_element_by_id("child").unwrap();
+        let viewport = (640.0, 480.0);
+        let mut cache = crate::css::StylesheetCache::default();
+        let mut initial = layout_dom_with_web_fonts_and_stylesheet_cache(
+            &tree, viewport, &HashMap::new(), &[], &mut cache,
+        );
+        assert_eq!(initial.styles[&font].font_size, Some(10.0));
+        for (old, new, expected) in [(Some("1"), Some("6"), 32.0), (Some("6"), None, 20.0)] {
+            tree.with_node_mut(font, |node| {
+                if let Some(value) = new { node.set_attribute("size", value.into()); }
+                else { node.remove_attribute_ns("", "size"); }
+            });
+            let retained = RetainedStyleMaps {
+                styles: std::mem::take(&mut initial.styles),
+                custom_properties: std::mem::take(&mut initial.custom_properties),
+            };
+            let (incremental, _) = layout_dom_with_web_fonts_pass_limit(
+                &tree, viewport, &HashMap::new(), &[], None, Some(&mut cache), Some(retained),
+                &[AttributeStyleMutation { node: font, name: "size".into(),
+                    old_value: old.map(str::to_owned), new_value: new.map(str::to_owned) }.into()],
+            );
+            for node in [font, child] {
+                assert_eq!(incremental.styles[&node].font_size, Some(expected), "size={new:?}");
+            }
+            let full = layout_dom(&tree, viewport);
+            assert_computed_styles_match("font size mutation", &incremental, &full);
+            assert_eq!(incremental.rects, full.rects);
+            initial = incremental;
+        }
+    }
+
+    #[test]
+    fn absolute_font_size_keywords_use_the_default_medium_scale() {
+        let cases = [("xx-small", 9.0), ("x-small", 10.0), ("small", 13.0),
+            ("medium", 16.0), ("large", 18.0), ("x-large", 24.0),
+            ("xx-large", 32.0), ("xxx-large", 48.0)];
+        let mut html = String::from("<!doctype html><style>html{font-size:16px}body{font-size:20px}</style>");
+        for (index, (keyword, _)) in cases.iter().enumerate() {
+            html.push_str(&format!("<span id=k{index} style='font-size:{keyword}'>x</span>"));
+        }
+        let tree = parse_html(&html);
+        let laid = layout_dom(&tree, (640.0, 480.0));
+        for (index, (keyword, expected)) in cases.iter().enumerate() {
+            let node = tree.get_element_by_id(&format!("k{index}")).unwrap();
+            assert_eq!(laid.styles[&node].font_size, Some(*expected), "{keyword}");
+        }
     }
 
     #[test]

@@ -156,7 +156,9 @@ pub mod inline {
     }
 
     #[derive(Default)]
-    pub struct TextEngine;
+    pub struct TextEngine {
+        controls: Vec<(taffy::Size<f32>, bool)>,
+    }
 
     pub(crate) fn text_may_need_emoji_font(_text: &str) -> bool {
         false
@@ -164,15 +166,44 @@ pub mod inline {
 
     impl TextEngine {
         pub fn new() -> Self {
-            TextEngine
+            Self::default()
         }
 
         pub(crate) fn new_with_web_fonts(_fonts: &[WebFont]) -> Self {
-            TextEngine
+            Self::default()
         }
 
         pub(crate) fn new_with_web_fonts_and_emoji(_fonts: &[WebFont], _load_emoji: bool) -> Self {
-            TextEngine
+            Self::default()
+        }
+
+        pub(crate) fn register_native_control(
+            &mut self, width: f32, height: f32, style: &crate::LayoutStyle,
+        ) -> usize {
+            let index = self.controls.len();
+            let zero_min_content = matches!(style.width, crate::Dimension::Percent(_))
+                || matches!(style.max_width, crate::Dimension::Percent(_))
+                || [0, 4].into_iter().any(|index| style.size_expressions[index]
+                    .as_deref().is_some_and(|expression| expression.contains('%')));
+            self.controls.push((taffy::Size { width, height }, zero_min_content));
+            (1usize << (usize::BITS - 1)) | index
+        }
+
+        pub fn measure_taffy(
+            &mut self, index: usize, known: taffy::Size<Option<f32>>,
+            available: taffy::Size<taffy::AvailableSpace>,
+        ) -> taffy::Size<f32> {
+            let bit = 1usize << (usize::BITS - 1);
+            if index & bit == 0 { return taffy::Size::ZERO; }
+            let (intrinsic, zero_min_content) = self.controls[index & !bit];
+            taffy::Size {
+                width: known.width.unwrap_or_else(|| {
+                    if zero_min_content && matches!(available.width, taffy::AvailableSpace::MinContent) {
+                        0.0
+                    } else { intrinsic.width }
+                }),
+                height: known.height.unwrap_or(intrinsic.height),
+            }
         }
 
         pub fn register_replaced(
@@ -247,7 +278,7 @@ pub mod inline {
     }
 
     pub(crate) fn used_line_height(style: &crate::LayoutStyle) -> f32 {
-        TextEngine.selected_line_height(style)
+        TextEngine::new().selected_line_height(style)
     }
 
     pub(crate) fn is_replaced(local: &str) -> bool {
@@ -917,6 +948,14 @@ pub(crate) enum RadialGradientSize {
     Explicit(Dimension, Dimension),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableRowDisplay {
+    Row,
+    Group,
+    Header,
+    Footer,
+}
+
 /// One computed CSS counter operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CounterDirective {
@@ -975,6 +1014,9 @@ pub struct LayoutStyle {
     /// until the parent's computed outer/inner display is known. The DOM
     /// top-down pass copies that provenance and then clears this marker.
     pub(crate) display_inherit: bool,
+    /// Inline outer display before absolute-position blockification. Retained
+    /// styles need this provenance to reconstruct the hypothetical static box.
+    pub(crate) static_position_inline: bool,
     /// Original legacy flexbox display provenance. `Some(false)` is
     /// `-webkit-box`; `Some(true)` is `-webkit-inline-box`. A vertical legacy
     /// box with an active line clamp computes to flow-root/inline-block, but
@@ -1017,6 +1059,8 @@ pub struct LayoutStyle {
     /// `<td>`/`<th>` elements even though Taffy represents their cell-content
     /// wrapper as an internal column flexbox.
     pub(crate) is_table_cell_box: bool,
+    /// Table row/group provenance, independent of the internal layout stand-in.
+    pub(crate) table_row_display: Option<TableRowDisplay>,
     /// The HTML UA sheet's vendor `text-align` behavior for `<center>`.
     /// Unlike ordinary `text-align:center`, it also centers fixed-width block
     /// descendants while leaving auto-width blocks fill-available.
@@ -1245,6 +1289,10 @@ pub struct LayoutStyle {
     /// Keeping this provenance distinguishes an explicit zero from the
     /// `normal` initial value while resolving the inherited property.
     pub letter_spacing_non_normal: Option<bool>,
+    /// Additional advance per word separator, resolved to CSS pixels before inheritance.
+    pub word_spacing: Option<f32>,
+    /// Relative length retained until the element's font size is resolved.
+    pub word_spacing_raw: Option<Dimension>,
     /// Specified CSS font weight during cascade (`1..1000`, `bolder`, or
     /// `lighter`), normalized to its numeric computed value by the inheritance
     /// pass before layout and shaping.
@@ -1417,6 +1465,9 @@ pub struct LayoutStyle {
     /// a real inherited CSS property). Resolved into `effectively_invisible`
     /// during `dom::layout_dom`'s inheritance pass.
     pub visibility_hidden: Option<bool>,
+    // Preserve the own value above for retained inheritance updates while
+    // exposing the resolved inherited value through CSSOM snapshots.
+    pub(crate) computed_visibility_hidden: bool,
     /// Computed `pointer-events: none|auto`. The property is inherited, so
     /// `None` means the top-down style pass still needs the parent's value.
     pub pointer_events_none: Option<bool>,
@@ -1694,8 +1745,15 @@ pub(crate) fn is_inline_level_box(style: &LayoutStyle) -> bool {
 /// Thus inline-flex becomes flex and inline-grid becomes grid, while
 /// inline-block/plain inline become block.
 pub(crate) fn blockify_outer_display(style: &mut LayoutStyle) {
+    if style.display != Display::None && style.table_row_display.take().is_some() {
+        style.display = Display::Block;
+        style.internal_flex_container = false;
+    }
     if !is_inline_level_box(style) {
         return;
+    }
+    if matches!(style.position, Some(taffy::Position::Absolute)) {
+        style.static_position_inline = true;
     }
     if style.display == Display::Inline {
         style.display = Display::Block;
